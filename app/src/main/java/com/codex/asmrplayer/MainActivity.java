@@ -69,6 +69,8 @@ public class MainActivity extends Activity {
     private WorkItem activeWork;
     private int currentIndex = -1;
     private int currentCueIndex = -1;
+    private int currentImageIndex = 0;
+    private int movingTrackIndex = -1;
     private boolean userSeeking;
     private int pageMode = PAGE_WORKS;
 
@@ -189,6 +191,7 @@ public class MainActivity extends Activity {
         coverView = new ImageView(this);
         coverView.setBackgroundColor(Color.rgb(31, 35, 41));
         coverView.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        coverView.setOnClickListener(v -> showNextTrackImage());
         LinearLayout.LayoutParams coverParams = new LinearLayout.LayoutParams(-1, 0);
         coverParams.weight = 1f;
         coverParams.topMargin = dp(18);
@@ -289,6 +292,7 @@ public class MainActivity extends Activity {
         browserList.setPadding(0, dp(16), 0, dp(20));
         browserList.setAdapter(browserAdapter);
         browserList.setOnItemClickListener(this::onListItemClick);
+        browserList.setOnItemLongClickListener((parent, view, position, id) -> onListItemLongClick(position));
         page.addView(browserList, new LinearLayout.LayoutParams(-1, 0, 1.7f));
 
         lyricsList = new ListView(this);
@@ -414,6 +418,7 @@ public class MainActivity extends Activity {
         cues.clear();
         activeWork = null;
         currentIndex = -1;
+        movingTrackIndex = -1;
         releasePlayer();
         resetPlaybackUi();
         updateMiniPlayer();
@@ -532,8 +537,48 @@ public class MainActivity extends Activity {
         if (pageMode == PAGE_WORKS) {
             openWork(works.get(position));
         } else if (pageMode == PAGE_TRACKS) {
+            if (movingTrackIndex >= 0) {
+                moveTrack(movingTrackIndex, position);
+                return;
+            }
             playAt(position, true);
         }
+    }
+
+    private boolean onListItemLongClick(int position) {
+        if (pageMode != PAGE_TRACKS || position < 0 || position >= playlist.size()) {
+            return false;
+        }
+        movingTrackIndex = position;
+        browserAdapter.notifyDataSetChanged();
+        sectionSubtitleView.setText("移动: 点击目标位置");
+        statusView.setText("点击目标位置完成移动");
+        Toast.makeText(this, "点击目标位置移动音轨", Toast.LENGTH_SHORT).show();
+        return true;
+    }
+
+    private void moveTrack(int from, int to) {
+        if (from < 0 || from >= playlist.size() || to < 0 || to >= playlist.size()) {
+            movingTrackIndex = -1;
+            return;
+        }
+        MediaItem item = playlist.remove(from);
+        playlist.add(to, item);
+        if (activeWork != null) {
+            activeWork.tracks.clear();
+            activeWork.tracks.addAll(playlist);
+        }
+        if (currentIndex == from) {
+            currentIndex = to;
+        } else if (from < currentIndex && to >= currentIndex) {
+            currentIndex--;
+        } else if (from > currentIndex && to <= currentIndex) {
+            currentIndex++;
+        }
+        movingTrackIndex = -1;
+        browserAdapter.notifyDataSetChanged();
+        sectionSubtitleView.setText("音轨列表");
+        statusView.setText("已移动音轨");
     }
 
     private void openWork(WorkItem work) {
@@ -543,6 +588,7 @@ public class MainActivity extends Activity {
             releasePlayer();
         }
         activeWork = work;
+        movingTrackIndex = -1;
         playlist.clear();
         playlist.addAll(work.tracks);
         pageMode = PAGE_TRACKS;
@@ -566,6 +612,7 @@ public class MainActivity extends Activity {
 
     private void showWorks() {
         pageMode = PAGE_WORKS;
+        movingTrackIndex = -1;
         updatePageChrome(true);
         browserAdapter.notifyDataSetChanged();
         sectionTitleView.setText("作品列表");
@@ -585,6 +632,7 @@ public class MainActivity extends Activity {
             return;
         }
         pageMode = PAGE_TRACKS;
+        movingTrackIndex = -1;
         updatePageChrome(true);
         browserAdapter.notifyDataSetChanged();
         sectionTitleView.setText(activeWork.name);
@@ -675,13 +723,8 @@ public class MainActivity extends Activity {
         titleView.setText(item.audio.name);
         folderView.setText(activeWork == null ? item.audio.parentPath : activeWork.name);
         lyricView.setText(item.vtt == null ? "未找到同名 .vtt 字幕" : "字幕已载入");
-        if (item.image != null) {
-            coverView.setImageURI(item.image.uri);
-        } else if (activeWork != null && activeWork.cover != null) {
-            coverView.setImageURI(activeWork.cover.uri);
-        } else {
-            coverView.setImageDrawable(null);
-        }
+        currentImageIndex = 0;
+        showCurrentTrackImage();
         loadCues(item.vtt);
         currentCueIndex = -1;
         lyricsAdapter.notifyDataSetChanged();
@@ -927,6 +970,7 @@ public class MainActivity extends Activity {
     private void resetPlaybackUi() {
         coverView.setImageDrawable(null);
         lyricView.setText("");
+        currentImageIndex = 0;
         seekBar.setProgress(0);
         seekBar.setMax(0);
         miniSeekBar.setProgress(0);
@@ -969,6 +1013,35 @@ public class MainActivity extends Activity {
         }
         miniPlayButton.setText(playing ? "暂停" : "播放");
         playButton.setText(playing ? "暂停" : "播放");
+    }
+
+    private void showCurrentTrackImage() {
+        if (currentIndex < 0 || currentIndex >= playlist.size()) {
+            coverView.setImageDrawable(null);
+            return;
+        }
+        MediaItem item = playlist.get(currentIndex);
+        if (!item.images.isEmpty()) {
+            currentImageIndex = Math.max(0, Math.min(currentImageIndex, item.images.size() - 1));
+            coverView.setImageURI(item.images.get(currentImageIndex).uri);
+        } else if (activeWork != null && activeWork.cover != null) {
+            coverView.setImageURI(activeWork.cover.uri);
+        } else {
+            coverView.setImageDrawable(null);
+        }
+    }
+
+    private void showNextTrackImage() {
+        if (pageMode != PAGE_PLAYER || currentIndex < 0 || currentIndex >= playlist.size()) {
+            return;
+        }
+        MediaItem item = playlist.get(currentIndex);
+        if (item.images.size() <= 1) {
+            return;
+        }
+        currentImageIndex = (currentImageIndex + 1) % item.images.size();
+        showCurrentTrackImage();
+        statusView.setText("图片 " + (currentImageIndex + 1) + "/" + item.images.size());
     }
 
     private boolean isSupportedAsset(String name) {
@@ -1095,14 +1168,18 @@ public class MainActivity extends Activity {
             row.setPadding(dp(12), dp(7), dp(12), dp(7));
             row.setMinimumHeight(dp(58));
 
-            int titleColor = position == currentIndex ? Color.rgb(143, 210, 182) : Color.rgb(230, 233, 237);
+            int titleColor = position == movingTrackIndex
+                    ? Color.rgb(245, 199, 117)
+                    : (position == currentIndex ? Color.rgb(143, 210, 182) : Color.rgb(230, 233, 237));
             TextView title = label(item.audio.name, 15, titleColor);
             title.setSingleLine(true);
             title.setEllipsize(TextUtils.TruncateAt.END);
             row.addView(title, new LinearLayout.LayoutParams(-1, 0, 1));
 
-            String subtitle = (item.vtt == null ? "无字幕" : "VTT") + " · " + item.audio.parentPath;
-            TextView sub = label(subtitle, 12, Color.rgb(160, 169, 178));
+            String subtitle = position == movingTrackIndex
+                    ? "移动中 · 点击目标位置"
+                    : (item.vtt == null ? "无字幕" : "VTT") + " · " + item.audio.parentPath;
+            TextView sub = label(subtitle, 12, position == movingTrackIndex ? Color.rgb(245, 199, 117) : Color.rgb(160, 169, 178));
             sub.setSingleLine(true);
             sub.setEllipsize(TextUtils.TruncateAt.END);
             row.addView(sub, new LinearLayout.LayoutParams(-1, 0, 1));
@@ -1178,11 +1255,39 @@ public class MainActivity extends Activity {
             FileDoc cover = images.isEmpty() ? null : images.get(0);
             List<MediaItem> tracks = new ArrayList<>();
             for (FileDoc file : audio) {
-                FileDoc image = imageByStem.get(stemStatic(file.name));
+                List<FileDoc> trackImages = collectImagesFor(file, cover);
                 FileDoc vtt = findVtt(file);
-                tracks.add(new MediaItem(file, image != null ? image : cover, vtt));
+                tracks.add(new MediaItem(file, trackImages, vtt));
             }
             return new WorkItem(name, cover, tracks);
+        }
+
+        private List<FileDoc> collectImagesFor(FileDoc audioFile, FileDoc cover) {
+            List<FileDoc> result = new ArrayList<>();
+            FileDoc sameName = imageByStem.get(stemStatic(audioFile.name));
+            addUnique(result, sameName);
+            for (FileDoc image : images) {
+                if (image.parentPath.equals(audioFile.parentPath)) {
+                    addUnique(result, image);
+                }
+            }
+            for (FileDoc image : images) {
+                addUnique(result, image);
+            }
+            addUnique(result, cover);
+            return result;
+        }
+
+        private void addUnique(List<FileDoc> result, FileDoc image) {
+            if (image == null) {
+                return;
+            }
+            for (FileDoc existing : result) {
+                if (existing.uri.equals(image.uri)) {
+                    return;
+                }
+            }
+            result.add(image);
         }
 
         private FileDoc findVtt(FileDoc audioFile) {
@@ -1251,11 +1356,13 @@ public class MainActivity extends Activity {
     private static class MediaItem {
         final FileDoc audio;
         final FileDoc image;
+        final List<FileDoc> images;
         final FileDoc vtt;
 
-        MediaItem(FileDoc audio, FileDoc image, FileDoc vtt) {
+        MediaItem(FileDoc audio, List<FileDoc> images, FileDoc vtt) {
             this.audio = audio;
-            this.image = image;
+            this.images = images;
+            this.image = images.isEmpty() ? null : images.get(0);
             this.vtt = vtt;
         }
     }
