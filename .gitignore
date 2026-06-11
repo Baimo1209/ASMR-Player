@@ -1,0 +1,12 @@
+.android-sdk/
+.gradle/
+.gradle-local/
+.ref-Asmr-Player/
+app/build/
+*.iml
+local.properties
+*.apk
+RJ*/
+*.mp3
+*.wav
+*.vtt
