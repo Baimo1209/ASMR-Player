@@ -19,7 +19,7 @@
 
 ## 安装
 
-在 GitHub Release 中下载 `白沫播放器-debug.apk`，复制到安卓手机并允许安装未知来源应用后安装。
+在 GitHub Release 中下载 `BaimoPlayer-v1.0.0-debug.apk`，复制到安卓手机并允许安装未知来源应用后安装。
 
 ## 构建
 
@@ -32,7 +32,7 @@
 The installable debug APK is written to:
 
 ```text
-白沫播放器-debug.apk
+BaimoPlayer-v1.0.0-debug.apk
 ```
 
 ## 目录匹配规则

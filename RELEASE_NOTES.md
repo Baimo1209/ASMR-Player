@@ -16,7 +16,7 @@
 
 ## 安装
 
-下载 Release 中的 `白沫播放器-debug.apk`，在安卓设备上允许安装未知来源应用后安装。
+下载 Release 中的 `BaimoPlayer-v1.0.0-debug.apk`，在安卓设备上允许安装未知来源应用后安装。
 
 ## 说明
 
