@@ -14,6 +14,7 @@ import android.os.Looper;
 import android.provider.DocumentsContract;
 import android.text.TextUtils;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
@@ -41,6 +42,10 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
 public class MainActivity extends Activity {
     private static final int REQ_OPEN_TREE = 1001;
     private static final int MAX_SCAN_DEPTH = 8;
@@ -53,6 +58,7 @@ public class MainActivity extends Activity {
     private static final String ICON_LYRICS = "☰";
     private static final String PREFS = "asmr_pocket_prefs";
     private static final String KEY_TREE_URI = "tree_uri";
+    private static final String KEY_LIBRARY_CACHE = "library_cache";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final List<WorkItem> works = new ArrayList<>();
@@ -75,6 +81,7 @@ public class MainActivity extends Activity {
     private int currentImageIndex = 0;
     private int movingWorkIndex = -1;
     private int movingTrackIndex = -1;
+    private boolean draggingListItem;
     private boolean userSeeking;
     private int pageMode = PAGE_WORKS;
 
@@ -108,8 +115,11 @@ public class MainActivity extends Activity {
         buildUi();
 
         String saved = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_TREE_URI, null);
-        if (!TextUtils.isEmpty(saved)) {
-            scanFolder(Uri.parse(saved));
+        if (!TextUtils.isEmpty(saved) && !loadCachedLibrary()) {
+            folderView.setText(saved);
+            titleView.setText("已保存文件夹授权");
+            lyricView.setText("请点击选择文件夹重新扫描一次，之后会使用缓存快速进入");
+            sectionSubtitleView.setText("未找到预加载缓存");
         }
     }
 
@@ -260,7 +270,10 @@ public class MainActivity extends Activity {
         playButton.setAllCaps(false);
         playButton.setBackgroundResource(R.drawable.button_primary);
         playButton.setOnClickListener(v -> togglePlayback());
-        LinearLayout.LayoutParams playParams = new LinearLayout.LayoutParams(dp(68), dp(48));
+        playButton.setMinWidth(0);
+        playButton.setMinimumWidth(0);
+        playButton.setPadding(0, 0, 0, 0);
+        LinearLayout.LayoutParams playParams = new LinearLayout.LayoutParams(0, dp(48), 1.15f);
         playParams.leftMargin = dp(3);
         playParams.rightMargin = dp(3);
         controls.addView(playButton, playParams);
@@ -274,8 +287,12 @@ public class MainActivity extends Activity {
         lyricsButton.setAllCaps(false);
         lyricsButton.setBackgroundResource(R.drawable.button_icon);
         lyricsButton.setOnClickListener(v -> showLyrics());
-        LinearLayout.LayoutParams lyricsParams = new LinearLayout.LayoutParams(dp(48), dp(44));
+        lyricsButton.setMinWidth(0);
+        lyricsButton.setMinimumWidth(0);
+        lyricsButton.setPadding(0, 0, 0, 0);
+        LinearLayout.LayoutParams lyricsParams = new LinearLayout.LayoutParams(0, dp(44), 1f);
         lyricsParams.leftMargin = dp(2);
+        lyricsParams.rightMargin = dp(2);
         controls.addView(lyricsButton, lyricsParams);
 
         LinearLayout meta = new LinearLayout(this);
@@ -298,6 +315,7 @@ public class MainActivity extends Activity {
         browserList.setAdapter(browserAdapter);
         browserList.setOnItemClickListener(this::onListItemClick);
         browserList.setOnItemLongClickListener((parent, view, position, id) -> onListItemLongClick(position));
+        browserList.setOnTouchListener((v, event) -> handleListDrag(event));
         page.addView(browserList, new LinearLayout.LayoutParams(-1, 0, 1.7f));
 
         lyricsList = new ListView(this);
@@ -379,7 +397,7 @@ public class MainActivity extends Activity {
     }
 
     private LinearLayout.LayoutParams buttonParams() {
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(dp(38), dp(44));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(44), 1f);
         params.leftMargin = dp(2);
         params.rightMargin = dp(2);
         return params;
@@ -413,11 +431,11 @@ public class MainActivity extends Activity {
             }
             getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
             getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_TREE_URI, uri.toString()).apply();
-            scanFolder(uri);
+            scanFolder(uri, new ArrayList<>(works));
         }
     }
 
-    private void scanFolder(Uri treeUri) {
+    private void scanFolder(Uri treeUri, List<WorkItem> cachedOrder) {
         works.clear();
         playlist.clear();
         cues.clear();
@@ -425,6 +443,7 @@ public class MainActivity extends Activity {
         currentIndex = -1;
         movingWorkIndex = -1;
         movingTrackIndex = -1;
+        draggingListItem = false;
         releasePlayer();
         resetPlaybackUi();
         updateMiniPlayer();
@@ -436,12 +455,15 @@ public class MainActivity extends Activity {
 
         final Collator collator = Collator.getInstance(Locale.CHINA);
         Collections.sort(builders, (left, right) -> collator.compare(left.name, right.name));
+        List<WorkItem> scannedWorks = new ArrayList<>();
         for (WorkBuilder builder : builders) {
             WorkItem work = builder.toWork(collator);
             if (!work.tracks.isEmpty()) {
-                works.add(work);
+                scannedWorks.add(work);
             }
         }
+        works.addAll(mergeWorks(scannedWorks, cachedOrder));
+        saveLibraryCache();
 
         pageMode = PAGE_WORKS;
         browserAdapter.notifyDataSetChanged();
@@ -462,6 +484,220 @@ public class MainActivity extends Activity {
         }
     }
 
+    private List<WorkItem> mergeWorks(List<WorkItem> scannedWorks, List<WorkItem> cachedOrder) {
+        Map<String, WorkItem> scannedByKey = new LinkedHashMap<>();
+        for (WorkItem work : scannedWorks) {
+            scannedByKey.put(work.key, work);
+        }
+
+        Map<String, WorkItem> cachedByKey = new HashMap<>();
+        for (WorkItem work : cachedOrder) {
+            cachedByKey.put(work.key, work);
+        }
+
+        List<WorkItem> merged = new ArrayList<>();
+        for (WorkItem work : scannedWorks) {
+            if (!cachedByKey.containsKey(work.key)) {
+                merged.add(work);
+            }
+        }
+        for (WorkItem cached : cachedOrder) {
+            WorkItem scanned = scannedByKey.get(cached.key);
+            if (scanned != null) {
+                List<MediaItem> mergedTracks = mergeTracks(scanned.tracks, cached.tracks);
+                scanned.tracks.clear();
+                scanned.tracks.addAll(mergedTracks);
+                merged.add(scanned);
+            }
+        }
+        return merged;
+    }
+
+    private List<MediaItem> mergeTracks(List<MediaItem> scannedTracks, List<MediaItem> cachedOrder) {
+        Map<String, MediaItem> scannedByKey = new LinkedHashMap<>();
+        for (MediaItem item : scannedTracks) {
+            scannedByKey.put(item.key, item);
+        }
+
+        Map<String, MediaItem> cachedByKey = new HashMap<>();
+        for (MediaItem item : cachedOrder) {
+            cachedByKey.put(item.key, item);
+        }
+
+        List<MediaItem> merged = new ArrayList<>();
+        for (MediaItem item : scannedTracks) {
+            if (!cachedByKey.containsKey(item.key)) {
+                merged.add(item);
+            }
+        }
+        for (MediaItem cached : cachedOrder) {
+            MediaItem scanned = scannedByKey.get(cached.key);
+            if (scanned != null) {
+                merged.add(scanned);
+            }
+        }
+        return merged;
+    }
+
+    private boolean loadCachedLibrary() {
+        String cache = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_LIBRARY_CACHE, null);
+        if (TextUtils.isEmpty(cache)) {
+            return false;
+        }
+        try {
+            JSONObject root = new JSONObject(cache);
+            JSONArray array = root.optJSONArray("works");
+            if (array == null) {
+                return false;
+            }
+            works.clear();
+            playlist.clear();
+            cues.clear();
+            activeWork = null;
+            currentIndex = -1;
+            movingWorkIndex = -1;
+            movingTrackIndex = -1;
+            draggingListItem = false;
+            resetPlaybackUi();
+            updateMiniPlayer();
+            for (int i = 0; i < array.length(); i++) {
+                WorkItem work = workFromJson(array.getJSONObject(i));
+                if (!work.tracks.isEmpty()) {
+                    works.add(work);
+                }
+            }
+            pageMode = PAGE_WORKS;
+            browserAdapter.notifyDataSetChanged();
+            updatePageChrome(false);
+            String tree = root.optString("treeUri", getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_TREE_URI, ""));
+            folderView.setText(tree);
+            statusView.setText("已加载缓存");
+            if (works.isEmpty()) {
+                sectionTitleView.setText("作品列表");
+                sectionSubtitleView.setText("缓存中没有可播放作品");
+                titleView.setText("未找到缓存作品");
+                lyricView.setText("请选择文件夹重新扫描");
+            } else {
+                sectionTitleView.setText("作品列表");
+                sectionSubtitleView.setText("已预加载 " + works.size() + " 个作品");
+                titleView.setText("已预加载 " + works.size() + " 个作品");
+                lyricView.setText("点击作品查看音轨并播放");
+                showWorkPreview(works.get(0));
+            }
+            return true;
+        } catch (JSONException ex) {
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(KEY_LIBRARY_CACHE).apply();
+            return false;
+        }
+    }
+
+    private void saveLibraryCache() {
+        try {
+            JSONObject root = new JSONObject();
+            root.put("treeUri", getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_TREE_URI, ""));
+            JSONArray array = new JSONArray();
+            for (WorkItem work : works) {
+                array.put(workToJson(work));
+            }
+            root.put("works", array);
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putString(KEY_LIBRARY_CACHE, root.toString())
+                    .apply();
+        } catch (JSONException ignored) {
+        }
+    }
+
+    private JSONObject workToJson(WorkItem work) throws JSONException {
+        JSONObject object = new JSONObject();
+        object.put("key", work.key);
+        object.put("name", work.name);
+        object.put("cover", fileToJson(work.cover));
+        JSONArray tracks = new JSONArray();
+        for (MediaItem item : work.tracks) {
+            tracks.put(mediaToJson(item));
+        }
+        object.put("tracks", tracks);
+        return object;
+    }
+
+    private WorkItem workFromJson(JSONObject object) throws JSONException {
+        String name = object.optString("name", "");
+        String key = object.optString("key", name);
+        FileDoc cover = fileFromJson(object.optJSONObject("cover"));
+        JSONArray trackArray = object.optJSONArray("tracks");
+        List<MediaItem> tracks = new ArrayList<>();
+        if (trackArray != null) {
+            for (int i = 0; i < trackArray.length(); i++) {
+                MediaItem item = mediaFromJson(trackArray.getJSONObject(i));
+                if (item != null) {
+                    tracks.add(item);
+                }
+            }
+        }
+        return new WorkItem(key, name, cover, tracks);
+    }
+
+    private JSONObject mediaToJson(MediaItem item) throws JSONException {
+        JSONObject object = new JSONObject();
+        object.put("audio", fileToJson(item.audio));
+        object.put("vtt", fileToJson(item.vtt));
+        JSONArray images = new JSONArray();
+        for (FileDoc image : item.images) {
+            images.put(fileToJson(image));
+        }
+        object.put("images", images);
+        return object;
+    }
+
+    private MediaItem mediaFromJson(JSONObject object) throws JSONException {
+        FileDoc audio = fileFromJson(object.optJSONObject("audio"));
+        if (audio == null) {
+            return null;
+        }
+        FileDoc vtt = fileFromJson(object.optJSONObject("vtt"));
+        JSONArray imageArray = object.optJSONArray("images");
+        List<FileDoc> images = new ArrayList<>();
+        if (imageArray != null) {
+            for (int i = 0; i < imageArray.length(); i++) {
+                FileDoc image = fileFromJson(imageArray.optJSONObject(i));
+                if (image != null) {
+                    images.add(image);
+                }
+            }
+        }
+        return new MediaItem(audio, images, vtt);
+    }
+
+    private Object fileToJson(FileDoc file) throws JSONException {
+        if (file == null) {
+            return JSONObject.NULL;
+        }
+        JSONObject object = new JSONObject();
+        object.put("name", file.name);
+        object.put("mime", file.mime);
+        object.put("uri", file.uri.toString());
+        object.put("relativePath", file.relativePath);
+        object.put("parentPath", file.parentPath);
+        return object;
+    }
+
+    private FileDoc fileFromJson(JSONObject object) {
+        if (object == null) {
+            return null;
+        }
+        String uri = object.optString("uri", "");
+        if (TextUtils.isEmpty(uri)) {
+            return null;
+        }
+        return new FileDoc(
+                object.optString("name", ""),
+                object.optString("mime", ""),
+                Uri.parse(uri),
+                object.optString("relativePath", ""),
+                object.optString("parentPath", "")
+        );
+    }
+
     private List<WorkBuilder> buildWorks(List<FileDoc> files, String selectedName) {
         Map<String, WorkBuilder> map = new LinkedHashMap<>();
         boolean selectedLooksLikeWork = looksLikeWorkName(selectedName);
@@ -470,11 +706,11 @@ public class MainActivity extends Activity {
             if (!isSupportedAsset(file.name)) {
                 continue;
             }
-            String key = selectedLooksLikeWork ? "" : firstPathSegment(file.relativePath);
+            String key = selectedLooksLikeWork ? selectedName : firstPathSegment(file.relativePath);
             String name = selectedLooksLikeWork || TextUtils.isEmpty(key) ? selectedName : key;
             WorkBuilder builder = map.get(key);
             if (builder == null) {
-                builder = new WorkBuilder(name);
+                builder = new WorkBuilder(key, name);
                 map.put(key, builder);
             }
             builder.add(file);
@@ -540,17 +776,12 @@ public class MainActivity extends Activity {
     }
 
     private void onListItemClick(AdapterView<?> parent, View view, int position, long id) {
+        if (draggingListItem || movingWorkIndex >= 0 || movingTrackIndex >= 0) {
+            return;
+        }
         if (pageMode == PAGE_WORKS) {
-            if (movingWorkIndex >= 0) {
-                moveWork(movingWorkIndex, position);
-                return;
-            }
             openWork(works.get(position));
         } else if (pageMode == PAGE_TRACKS) {
-            if (movingTrackIndex >= 0) {
-                moveTrack(movingTrackIndex, position);
-                return;
-            }
             playAt(position, true);
         }
     }
@@ -559,37 +790,81 @@ public class MainActivity extends Activity {
         if (pageMode == PAGE_WORKS && position >= 0 && position < works.size()) {
             movingWorkIndex = position;
             movingTrackIndex = -1;
+            draggingListItem = true;
             browserAdapter.notifyDataSetChanged();
-            sectionSubtitleView.setText("移动作品: 点击目标位置");
-            Toast.makeText(this, "点击目标位置移动作品", Toast.LENGTH_SHORT).show();
+            sectionSubtitleView.setText("按住拖动作品，松开保存位置");
+            Toast.makeText(this, "拖动到目标位置后松开", Toast.LENGTH_SHORT).show();
             return true;
         }
         if (pageMode == PAGE_TRACKS && position >= 0 && position < playlist.size()) {
             movingTrackIndex = position;
             movingWorkIndex = -1;
+            draggingListItem = true;
             browserAdapter.notifyDataSetChanged();
-            sectionSubtitleView.setText("移动音轨: 点击目标位置");
-            statusView.setText("点击目标位置完成移动");
-            Toast.makeText(this, "点击目标位置移动音轨", Toast.LENGTH_SHORT).show();
+            sectionSubtitleView.setText("按住拖动音轨，松开保存位置");
+            statusView.setText("拖动排序中");
+            Toast.makeText(this, "拖动到目标位置后松开", Toast.LENGTH_SHORT).show();
             return true;
         }
         return false;
     }
 
-    private void moveWork(int from, int to) {
+    private boolean handleListDrag(MotionEvent event) {
+        if (!draggingListItem) {
+            return false;
+        }
+        if (event.getAction() == MotionEvent.ACTION_MOVE) {
+            int target = browserList.pointToPosition((int) event.getX(), (int) event.getY());
+            if (target != AdapterView.INVALID_POSITION) {
+                if (pageMode == PAGE_WORKS && movingWorkIndex >= 0 && target != movingWorkIndex) {
+                    moveWorkDuringDrag(movingWorkIndex, target);
+                } else if (pageMode == PAGE_TRACKS && movingTrackIndex >= 0 && target != movingTrackIndex) {
+                    moveTrackDuringDrag(movingTrackIndex, target);
+                }
+            }
+            return true;
+        }
+        if (event.getAction() == MotionEvent.ACTION_UP || event.getAction() == MotionEvent.ACTION_CANCEL) {
+            finishListDrag();
+            return true;
+        }
+        return true;
+    }
+
+    private void finishListDrag() {
+        if (!draggingListItem) {
+            return;
+        }
+        boolean movedWork = movingWorkIndex >= 0;
+        boolean movedTrack = movingTrackIndex >= 0;
+        movingWorkIndex = -1;
+        movingTrackIndex = -1;
+        draggingListItem = false;
+        browserAdapter.notifyDataSetChanged();
+        saveLibraryCache();
+        if (movedWork) {
+            sectionSubtitleView.setText("已保存作品顺序");
+            statusView.setText("已移动作品");
+        } else if (movedTrack) {
+            sectionSubtitleView.setText("已保存音轨顺序");
+            statusView.setText("已移动音轨");
+        }
+    }
+
+    private void moveWorkDuringDrag(int from, int to) {
         if (from < 0 || from >= works.size() || to < 0 || to >= works.size()) {
             movingWorkIndex = -1;
             return;
         }
         WorkItem item = works.remove(from);
         works.add(to, item);
-        movingWorkIndex = -1;
+        movingWorkIndex = to;
         browserAdapter.notifyDataSetChanged();
-        sectionSubtitleView.setText(works.size() + " 个作品");
-        statusView.setText("已移动作品");
+        sectionSubtitleView.setText("作品移动到第 " + (to + 1) + " 位");
+        statusView.setText("拖动排序中");
     }
 
-    private void moveTrack(int from, int to) {
+    private void moveTrackDuringDrag(int from, int to) {
         if (from < 0 || from >= playlist.size() || to < 0 || to >= playlist.size()) {
             movingTrackIndex = -1;
             return;
@@ -607,10 +882,10 @@ public class MainActivity extends Activity {
         } else if (from > currentIndex && to <= currentIndex) {
             currentIndex++;
         }
-        movingTrackIndex = -1;
+        movingTrackIndex = to;
         browserAdapter.notifyDataSetChanged();
-        sectionSubtitleView.setText("音轨列表");
-        statusView.setText("已移动音轨");
+        sectionSubtitleView.setText("音轨移动到第 " + (to + 1) + " 位");
+        statusView.setText("拖动排序中");
     }
 
     private void openWork(WorkItem work) {
@@ -622,6 +897,7 @@ public class MainActivity extends Activity {
         activeWork = work;
         movingWorkIndex = -1;
         movingTrackIndex = -1;
+        draggingListItem = false;
         playlist.clear();
         playlist.addAll(work.tracks);
         pageMode = PAGE_TRACKS;
@@ -647,6 +923,7 @@ public class MainActivity extends Activity {
         pageMode = PAGE_WORKS;
         movingWorkIndex = -1;
         movingTrackIndex = -1;
+        draggingListItem = false;
         updatePageChrome(true);
         browserAdapter.notifyDataSetChanged();
         sectionTitleView.setText("作品列表");
@@ -668,6 +945,7 @@ public class MainActivity extends Activity {
         pageMode = PAGE_TRACKS;
         movingWorkIndex = -1;
         movingTrackIndex = -1;
+        draggingListItem = false;
         updatePageChrome(true);
         browserAdapter.notifyDataSetChanged();
         sectionTitleView.setText(activeWork.name);
@@ -1204,7 +1482,7 @@ public class MainActivity extends Activity {
             texts.addView(title, new LinearLayout.LayoutParams(-1, 0, 1));
 
             String coverState = work.cover == null ? "无封面" : "有封面";
-            String subtitle = moving ? "移动中 · 点击目标位置" : work.tracks.size() + " 首音轨 · " + coverState;
+            String subtitle = moving ? "拖动中 · 松开保存位置" : work.tracks.size() + " 首音轨 · " + coverState;
             TextView sub = label(subtitle, 13, moving ? Color.rgb(245, 199, 117) : Color.rgb(160, 169, 178));
             sub.setSingleLine(true);
             sub.setEllipsize(TextUtils.TruncateAt.END);
@@ -1229,7 +1507,7 @@ public class MainActivity extends Activity {
             row.addView(title, new LinearLayout.LayoutParams(-1, 0, 1));
 
             String subtitle = position == movingTrackIndex
-                    ? "移动中 · 点击目标位置"
+                    ? "拖动中 · 松开保存位置"
                     : (item.vtt == null ? "无字幕" : "VTT") + " · " + item.audio.parentPath;
             TextView sub = label(subtitle, 12, position == movingTrackIndex ? Color.rgb(245, 199, 117) : Color.rgb(160, 169, 178));
             sub.setSingleLine(true);
@@ -1278,13 +1556,15 @@ public class MainActivity extends Activity {
     }
 
     private static class WorkBuilder {
+        final String key;
         String name;
         final List<FileDoc> audio = new ArrayList<>();
         final List<FileDoc> images = new ArrayList<>();
         final Map<String, FileDoc> vttByName = new HashMap<>();
         final Map<String, FileDoc> imageByStem = new HashMap<>();
 
-        WorkBuilder(String name) {
+        WorkBuilder(String key, String name) {
+            this.key = TextUtils.isEmpty(key) ? name : key;
             this.name = name;
         }
 
@@ -1311,7 +1591,7 @@ public class MainActivity extends Activity {
                 FileDoc vtt = findVtt(file);
                 tracks.add(new MediaItem(file, trackImages, vtt));
             }
-            return new WorkItem(name, cover, tracks);
+            return new WorkItem(key, name, cover, tracks);
         }
 
         private List<FileDoc> collectImagesFor(FileDoc audioFile, FileDoc cover) {
@@ -1394,11 +1674,13 @@ public class MainActivity extends Activity {
     }
 
     private static class WorkItem {
+        final String key;
         final String name;
         final FileDoc cover;
         final List<MediaItem> tracks;
 
-        WorkItem(String name, FileDoc cover, List<MediaItem> tracks) {
+        WorkItem(String key, String name, FileDoc cover, List<MediaItem> tracks) {
+            this.key = TextUtils.isEmpty(key) ? name : key;
             this.name = name;
             this.cover = cover;
             this.tracks = tracks;
@@ -1406,12 +1688,14 @@ public class MainActivity extends Activity {
     }
 
     private static class MediaItem {
+        final String key;
         final FileDoc audio;
         final FileDoc image;
         final List<FileDoc> images;
         final FileDoc vtt;
 
         MediaItem(FileDoc audio, List<FileDoc> images, FileDoc vtt) {
+            this.key = audio.relativePath;
             this.audio = audio;
             this.images = images;
             this.image = images.isEmpty() ? null : images.get(0);
