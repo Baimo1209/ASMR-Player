@@ -48,6 +48,9 @@ public class MainActivity extends Activity {
     private static final int PAGE_TRACKS = 1;
     private static final int PAGE_PLAYER = 2;
     private static final int PAGE_LYRICS = 3;
+    private static final String ICON_PLAY = "▶";
+    private static final String ICON_PAUSE = "⏸";
+    private static final String ICON_LYRICS = "☰";
     private static final String PREFS = "asmr_pocket_prefs";
     private static final String KEY_TREE_URI = "tree_uri";
 
@@ -70,6 +73,7 @@ public class MainActivity extends Activity {
     private int currentIndex = -1;
     private int currentCueIndex = -1;
     private int currentImageIndex = 0;
+    private int movingWorkIndex = -1;
     private int movingTrackIndex = -1;
     private boolean userSeeking;
     private int pageMode = PAGE_WORKS;
@@ -190,7 +194,7 @@ public class MainActivity extends Activity {
 
         coverView = new ImageView(this);
         coverView.setBackgroundColor(Color.rgb(31, 35, 41));
-        coverView.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        coverView.setScaleType(ImageView.ScaleType.FIT_CENTER);
         coverView.setOnClickListener(v -> showNextTrackImage());
         LinearLayout.LayoutParams coverParams = new LinearLayout.LayoutParams(-1, 0);
         coverParams.weight = 1f;
@@ -250,9 +254,9 @@ public class MainActivity extends Activity {
         controls.addView(iconButton("⏮", v -> playRelative(-1, true)), buttonParams());
         controls.addView(iconButton("-15", v -> seekBy(-15000)), buttonParams());
         playButton = new Button(this);
-        playButton.setText("播放");
+        playButton.setText(ICON_PLAY);
         playButton.setTextColor(Color.WHITE);
-        playButton.setTextSize(16);
+        playButton.setTextSize(20);
         playButton.setAllCaps(false);
         playButton.setBackgroundResource(R.drawable.button_primary);
         playButton.setOnClickListener(v -> togglePlayback());
@@ -263,9 +267,10 @@ public class MainActivity extends Activity {
         controls.addView(iconButton("+15", v -> seekBy(15000)), buttonParams());
         controls.addView(iconButton("⏭", v -> playRelative(1, true)), buttonParams());
         lyricsButton = new Button(this);
-        lyricsButton.setText("台词");
+        lyricsButton.setText(ICON_LYRICS);
+        lyricsButton.setContentDescription("台词");
         lyricsButton.setTextColor(Color.WHITE);
-        lyricsButton.setTextSize(13);
+        lyricsButton.setTextSize(20);
         lyricsButton.setAllCaps(false);
         lyricsButton.setBackgroundResource(R.drawable.button_icon);
         lyricsButton.setOnClickListener(v -> showLyrics());
@@ -329,9 +334,9 @@ public class MainActivity extends Activity {
 
         miniTop.addView(iconButton("⏮", v -> playRelative(-1, false)), new LinearLayout.LayoutParams(dp(42), dp(36)));
         miniPlayButton = new Button(this);
-        miniPlayButton.setText("暂停");
+        miniPlayButton.setText(ICON_PAUSE);
         miniPlayButton.setTextColor(Color.WHITE);
-        miniPlayButton.setTextSize(13);
+        miniPlayButton.setTextSize(18);
         miniPlayButton.setAllCaps(false);
         miniPlayButton.setBackgroundResource(R.drawable.button_primary);
         miniPlayButton.setOnClickListener(v -> togglePlayback());
@@ -418,6 +423,7 @@ public class MainActivity extends Activity {
         cues.clear();
         activeWork = null;
         currentIndex = -1;
+        movingWorkIndex = -1;
         movingTrackIndex = -1;
         releasePlayer();
         resetPlaybackUi();
@@ -535,6 +541,10 @@ public class MainActivity extends Activity {
 
     private void onListItemClick(AdapterView<?> parent, View view, int position, long id) {
         if (pageMode == PAGE_WORKS) {
+            if (movingWorkIndex >= 0) {
+                moveWork(movingWorkIndex, position);
+                return;
+            }
             openWork(works.get(position));
         } else if (pageMode == PAGE_TRACKS) {
             if (movingTrackIndex >= 0) {
@@ -546,15 +556,37 @@ public class MainActivity extends Activity {
     }
 
     private boolean onListItemLongClick(int position) {
-        if (pageMode != PAGE_TRACKS || position < 0 || position >= playlist.size()) {
-            return false;
+        if (pageMode == PAGE_WORKS && position >= 0 && position < works.size()) {
+            movingWorkIndex = position;
+            movingTrackIndex = -1;
+            browserAdapter.notifyDataSetChanged();
+            sectionSubtitleView.setText("移动作品: 点击目标位置");
+            Toast.makeText(this, "点击目标位置移动作品", Toast.LENGTH_SHORT).show();
+            return true;
         }
-        movingTrackIndex = position;
+        if (pageMode == PAGE_TRACKS && position >= 0 && position < playlist.size()) {
+            movingTrackIndex = position;
+            movingWorkIndex = -1;
+            browserAdapter.notifyDataSetChanged();
+            sectionSubtitleView.setText("移动音轨: 点击目标位置");
+            statusView.setText("点击目标位置完成移动");
+            Toast.makeText(this, "点击目标位置移动音轨", Toast.LENGTH_SHORT).show();
+            return true;
+        }
+        return false;
+    }
+
+    private void moveWork(int from, int to) {
+        if (from < 0 || from >= works.size() || to < 0 || to >= works.size()) {
+            movingWorkIndex = -1;
+            return;
+        }
+        WorkItem item = works.remove(from);
+        works.add(to, item);
+        movingWorkIndex = -1;
         browserAdapter.notifyDataSetChanged();
-        sectionSubtitleView.setText("移动: 点击目标位置");
-        statusView.setText("点击目标位置完成移动");
-        Toast.makeText(this, "点击目标位置移动音轨", Toast.LENGTH_SHORT).show();
-        return true;
+        sectionSubtitleView.setText(works.size() + " 个作品");
+        statusView.setText("已移动作品");
     }
 
     private void moveTrack(int from, int to) {
@@ -588,6 +620,7 @@ public class MainActivity extends Activity {
             releasePlayer();
         }
         activeWork = work;
+        movingWorkIndex = -1;
         movingTrackIndex = -1;
         playlist.clear();
         playlist.addAll(work.tracks);
@@ -612,6 +645,7 @@ public class MainActivity extends Activity {
 
     private void showWorks() {
         pageMode = PAGE_WORKS;
+        movingWorkIndex = -1;
         movingTrackIndex = -1;
         updatePageChrome(true);
         browserAdapter.notifyDataSetChanged();
@@ -632,6 +666,7 @@ public class MainActivity extends Activity {
             return;
         }
         pageMode = PAGE_TRACKS;
+        movingWorkIndex = -1;
         movingTrackIndex = -1;
         updatePageChrome(true);
         browserAdapter.notifyDataSetChanged();
@@ -736,8 +771,8 @@ public class MainActivity extends Activity {
                 seekBar.setMax(mp.getDuration());
                 timeView.setText("00:00 / " + formatTime(mp.getDuration()));
                 mp.start();
-                playButton.setText("暂停");
-                miniPlayButton.setText("暂停");
+                playButton.setText(ICON_PAUSE);
+                miniPlayButton.setText(ICON_PAUSE);
                 statusView.setText("播放中");
                 handler.removeCallbacks(progressTick);
                 handler.post(progressTick);
@@ -765,13 +800,13 @@ public class MainActivity extends Activity {
         }
         if (player.isPlaying()) {
             player.pause();
-            playButton.setText("播放");
-            miniPlayButton.setText("播放");
+            playButton.setText(ICON_PLAY);
+            miniPlayButton.setText(ICON_PLAY);
             statusView.setText("已暂停");
         } else {
             player.start();
-            playButton.setText("暂停");
-            miniPlayButton.setText("暂停");
+            playButton.setText(ICON_PAUSE);
+            miniPlayButton.setText(ICON_PAUSE);
             statusView.setText("播放中");
             handler.post(progressTick);
         }
@@ -832,22 +867,37 @@ public class MainActivity extends Activity {
         if (cues.isEmpty()) {
             return;
         }
+        int activeIndex = -1;
         for (int i = 0; i < cues.size(); i++) {
             Cue cue = cues.get(i);
-            if (positionMs >= cue.startMs && positionMs <= cue.endMs) {
-                if (!cue.text.contentEquals(lyricView.getText())) {
-                    lyricView.setText(cue.text);
-                }
-                if (currentCueIndex != i) {
-                    currentCueIndex = i;
-                    lyricsAdapter.notifyDataSetChanged();
-                    if (pageMode == PAGE_LYRICS) {
-                        lyricsList.smoothScrollToPosition(i);
-                    }
-                }
-                return;
+            if (positionMs >= cue.startMs) {
+                activeIndex = i;
+            } else {
+                break;
             }
         }
+        if (activeIndex < 0) {
+            lyricView.setText("");
+            if (currentCueIndex != -1) {
+                currentCueIndex = -1;
+                lyricsAdapter.notifyDataSetChanged();
+            }
+            return;
+        }
+        Cue activeCue = cues.get(activeIndex);
+        if (!activeCue.text.contentEquals(lyricView.getText())) {
+            lyricView.setText(activeCue.text);
+        }
+        if (currentCueIndex != activeIndex) {
+            currentCueIndex = activeIndex;
+            lyricsAdapter.notifyDataSetChanged();
+            if (pageMode == PAGE_LYRICS) {
+                lyricsList.smoothScrollToPosition(activeIndex);
+            }
+        }
+    }
+
+    private void clearLyricState() {
         lyricView.setText("");
         if (currentCueIndex != -1) {
             currentCueIndex = -1;
@@ -891,8 +941,8 @@ public class MainActivity extends Activity {
         }
         currentCueIndex = position;
         lyricView.setText(cue.text);
-        playButton.setText("暂停");
-        miniPlayButton.setText("暂停");
+        playButton.setText(ICON_PAUSE);
+        miniPlayButton.setText(ICON_PAUSE);
         statusView.setText("播放中");
         handler.post(progressTick);
         lyricsAdapter.notifyDataSetChanged();
@@ -977,8 +1027,8 @@ public class MainActivity extends Activity {
         miniSeekBar.setMax(0);
         miniTimeView.setText("00:00 / 00:00");
         timeView.setText("00:00 / 00:00");
-        playButton.setText("播放");
-        miniPlayButton.setText("播放");
+        playButton.setText(ICON_PLAY);
+        miniPlayButton.setText(ICON_PLAY);
         updateMiniPlayer();
     }
 
@@ -1011,8 +1061,8 @@ public class MainActivity extends Activity {
             playing = player.isPlaying();
         } catch (IllegalStateException ignored) {
         }
-        miniPlayButton.setText(playing ? "暂停" : "播放");
-        playButton.setText(playing ? "暂停" : "播放");
+        miniPlayButton.setText(playing ? ICON_PAUSE : ICON_PLAY);
+        playButton.setText(playing ? ICON_PAUSE : ICON_PLAY);
     }
 
     private void showCurrentTrackImage() {
@@ -1119,12 +1169,12 @@ public class MainActivity extends Activity {
         @Override
         public View getView(int position, View convertView, ViewGroup parent) {
             if (pageMode == PAGE_WORKS) {
-                return workRow(works.get(position), convertView);
+                return workRow(works.get(position), position, convertView);
             }
             return trackRow(playlist.get(position), position, convertView);
         }
 
-        private View workRow(WorkItem work, View convertView) {
+        private View workRow(WorkItem work, int position, View convertView) {
             LinearLayout row = new LinearLayout(MainActivity.this);
             row.setOrientation(LinearLayout.HORIZONTAL);
             row.setGravity(Gravity.CENTER_VERTICAL);
@@ -1147,13 +1197,15 @@ public class MainActivity extends Activity {
             texts.setPadding(dp(12), 0, 0, 0);
             row.addView(texts, new LinearLayout.LayoutParams(0, -1, 1));
 
-            TextView title = label(work.name, 16, Color.rgb(236, 240, 243));
+            boolean moving = position == movingWorkIndex;
+            TextView title = label(work.name, 16, moving ? Color.rgb(245, 199, 117) : Color.rgb(236, 240, 243));
             title.setSingleLine(true);
             title.setEllipsize(TextUtils.TruncateAt.END);
             texts.addView(title, new LinearLayout.LayoutParams(-1, 0, 1));
 
             String coverState = work.cover == null ? "无封面" : "有封面";
-            TextView sub = label(work.tracks.size() + " 首音轨 · " + coverState, 13, Color.rgb(160, 169, 178));
+            String subtitle = moving ? "移动中 · 点击目标位置" : work.tracks.size() + " 首音轨 · " + coverState;
+            TextView sub = label(subtitle, 13, moving ? Color.rgb(245, 199, 117) : Color.rgb(160, 169, 178));
             sub.setSingleLine(true);
             sub.setEllipsize(TextUtils.TruncateAt.END);
             texts.addView(sub, new LinearLayout.LayoutParams(-1, 0, 1));
