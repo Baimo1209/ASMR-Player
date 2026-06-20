@@ -83,6 +83,7 @@ public class MainActivity extends Activity {
     private static final String KEY_FLOATING_LYRICS = "floating_lyrics";
     private static final String KEY_WEB_HISTORY = "web_history";
     private static final String KEY_RECENT_AUDIO = "recent_audio";
+    private static final String GITHUB_URL = "https://github.com/Baimo1209/ASMR-Player";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final List<WorkItem> works = new ArrayList<>();
@@ -629,6 +630,27 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams hintParams = new LinearLayout.LayoutParams(-1, -2);
         hintParams.topMargin = dp(14);
         area.addView(hint, hintParams);
+
+        LinearLayout thanksPanel = panel();
+        LinearLayout.LayoutParams thanksParams = new LinearLayout.LayoutParams(-1, -2);
+        thanksParams.topMargin = dp(24);
+        area.addView(thanksPanel, thanksParams);
+
+        TextView thanksTitle = label("感谢使用白沫播放器", 16, Color.WHITE);
+        thanksTitle.setGravity(Gravity.CENTER_VERTICAL);
+        thanksPanel.addView(thanksTitle, new LinearLayout.LayoutParams(-1, dp(28)));
+
+        TextView thanksBody = label("欢迎在 GitHub 提出意见、反馈问题或支持项目。你的建议会用于后续功能和体验优化。", 13, Color.rgb(184, 193, 202));
+        thanksBody.setMaxLines(4);
+        LinearLayout.LayoutParams bodyParams = new LinearLayout.LayoutParams(-1, -2);
+        bodyParams.topMargin = dp(6);
+        thanksPanel.addView(thanksBody, bodyParams);
+
+        Button githubButton = drawerButton("打开 GitHub 项目");
+        githubButton.setOnClickListener(v -> openExternalUrl(GITHUB_URL));
+        LinearLayout.LayoutParams githubParams = new LinearLayout.LayoutParams(-1, dp(46));
+        githubParams.topMargin = dp(12);
+        thanksPanel.addView(githubButton, githubParams);
         return area;
     }
 
@@ -767,6 +789,15 @@ public class MainActivity extends Activity {
                 | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
                 | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
         startActivityForResult(intent, REQ_OPEN_TREE);
+    }
+
+    private void openExternalUrl(String url) {
+        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+        try {
+            startActivity(intent);
+        } catch (Exception ex) {
+            Toast.makeText(this, "无法打开链接: " + url, Toast.LENGTH_LONG).show();
+        }
     }
 
     private void toggleFloatingLyrics() {
