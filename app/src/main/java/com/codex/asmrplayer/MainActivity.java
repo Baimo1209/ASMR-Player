@@ -2,25 +2,36 @@ package com.codex.asmrplayer;
 
 import android.app.Activity;
 import android.content.ContentResolver;
+import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
+import android.graphics.PixelFormat;
 import android.graphics.drawable.ColorDrawable;
 import android.media.MediaPlayer;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.DocumentsContract;
+import android.provider.Settings;
 import android.text.TextUtils;
+import android.util.LruCache;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import android.widget.AdapterView;
 import android.widget.BaseAdapter;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageButton;
 import android.widget.ImageView;
@@ -29,6 +40,9 @@ import android.widget.ListView;
 import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
@@ -41,6 +55,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -48,24 +64,45 @@ import org.json.JSONObject;
 
 public class MainActivity extends Activity {
     private static final int REQ_OPEN_TREE = 1001;
+    private static final int REQ_OVERLAY_PERMISSION = 1002;
     private static final int MAX_SCAN_DEPTH = 8;
     private static final int PAGE_WORKS = 0;
     private static final int PAGE_TRACKS = 1;
     private static final int PAGE_PLAYER = 2;
     private static final int PAGE_LYRICS = 3;
+    private static final int TAB_FIND = 0;
+    private static final int TAB_HEARD = 1;
+    private static final int TAB_MY = 2;
+    private static final int TAB_SETTINGS = 3;
     private static final String ICON_PLAY = "▶";
     private static final String ICON_PAUSE = "⏸";
     private static final String ICON_LYRICS = "☰";
     private static final String PREFS = "asmr_pocket_prefs";
     private static final String KEY_TREE_URI = "tree_uri";
     private static final String KEY_LIBRARY_CACHE = "library_cache";
+    private static final String KEY_FLOATING_LYRICS = "floating_lyrics";
+    private static final String KEY_WEB_HISTORY = "web_history";
+    private static final String KEY_RECENT_AUDIO = "recent_audio";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final List<WorkItem> works = new ArrayList<>();
     private final List<MediaItem> playlist = new ArrayList<>();
+    private final List<MediaItem> playbackQueue = new ArrayList<>();
     private final List<Cue> cues = new ArrayList<>();
+    private final List<String> webHistory = new ArrayList<>();
+    private final List<RecentTrack> recentTracks = new ArrayList<>();
+    private final ExecutorService imageExecutor = Executors.newFixedThreadPool(2);
+    private final TextDrawable workPlaceholder = new TextDrawable("ASMR");
+    private final LruCache<String, Bitmap> coverCache = new LruCache<String, Bitmap>(8192) {
+        @Override
+        protected int sizeOf(String key, Bitmap value) {
+            return Math.max(1, value.getByteCount() / 1024);
+        }
+    };
     private final BrowserAdapter browserAdapter = new BrowserAdapter();
     private final LyricsAdapter lyricsAdapter = new LyricsAdapter();
+    private final WebHistoryAdapter webHistoryAdapter = new WebHistoryAdapter();
+    private final RecentAdapter recentAdapter = new RecentAdapter();
     private final Runnable progressTick = new Runnable() {
         @Override
         public void run() {
@@ -76,15 +113,37 @@ public class MainActivity extends Activity {
 
     private MediaPlayer player;
     private WorkItem activeWork;
+    private WorkItem playbackWork;
     private int currentIndex = -1;
     private int currentCueIndex = -1;
     private int currentImageIndex = 0;
     private int movingWorkIndex = -1;
     private int movingTrackIndex = -1;
     private boolean draggingListItem;
+    private boolean floatingLyricsEnabled;
     private boolean userSeeking;
+    private int currentTab = TAB_MY;
     private int pageMode = PAGE_WORKS;
 
+    private FrameLayout rootLayout;
+    private View drawerScrim;
+    private LinearLayout settingsDrawer;
+    private Button floatingLyricsButton;
+    private WindowManager windowManager;
+    private TextView floatingLyricView;
+    private WindowManager.LayoutParams floatingLyricParams;
+    private LinearLayout findArea;
+    private EditText urlInput;
+    private WebView webView;
+    private ListView webHistoryList;
+    private ListView recentList;
+    private LinearLayout settingsArea;
+    private LinearLayout contentPanel;
+    private LinearLayout bottomNav;
+    private Button findTabButton;
+    private Button heardTabButton;
+    private Button myTabButton;
+    private Button settingsTabButton;
     private LinearLayout playerArea;
     private ListView browserList;
     private ListView lyricsList;
@@ -112,7 +171,15 @@ public class MainActivity extends Activity {
         Window window = getWindow();
         window.setStatusBarColor(Color.rgb(16, 18, 21));
         window.setNavigationBarColor(Color.rgb(16, 18, 21));
+        hideSystemBars();
+        floatingLyricsEnabled = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_FLOATING_LYRICS, false);
         buildUi();
+        loadWebHistory();
+        loadRecentTracks();
+        updateFloatingLyricsButton();
+        if (floatingLyricsEnabled && canDrawOverlays()) {
+            showFloatingLyrics();
+        }
 
         String saved = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_TREE_URI, null);
         if (!TextUtils.isEmpty(saved) && !loadCachedLibrary()) {
@@ -127,11 +194,44 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         super.onDestroy();
         handler.removeCallbacks(progressTick);
+        hideFloatingLyrics();
         releasePlayer();
+        imageExecutor.shutdownNow();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        hideSystemBars();
+        if (floatingLyricsEnabled) {
+            if (canDrawOverlays()) {
+                showFloatingLyrics();
+            } else {
+                floatingLyricsEnabled = false;
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_FLOATING_LYRICS, false).apply();
+                updateFloatingLyricsButton();
+            }
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            hideSystemBars();
+        }
     }
 
     @Override
     public void onBackPressed() {
+        if (settingsDrawer != null && settingsDrawer.getVisibility() == View.VISIBLE) {
+            hideSettingsDrawer();
+            return;
+        }
+        if (currentTab != TAB_MY) {
+            showMainTab(TAB_MY);
+            return;
+        }
         if (pageMode != PAGE_WORKS) {
             goBackPage();
             return;
@@ -140,26 +240,21 @@ public class MainActivity extends Activity {
     }
 
     private void buildUi() {
-        FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(Color.rgb(16, 18, 21));
+        rootLayout = new FrameLayout(this);
+        FrameLayout root = rootLayout;
+        root.setBackgroundColor(Color.rgb(50, 18, 12));
 
         LinearLayout page = new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
-        page.setPadding(dp(24), dp(24), dp(24), dp(22));
+        page.setPadding(0, dp(20), 0, 0);
         page.setGravity(Gravity.CENTER_HORIZONTAL);
         root.addView(page, new FrameLayout.LayoutParams(-1, -1));
 
         LinearLayout top = new LinearLayout(this);
         top.setOrientation(LinearLayout.HORIZONTAL);
         top.setGravity(Gravity.CENTER_VERTICAL);
-        page.addView(top, new LinearLayout.LayoutParams(-1, dp(44)));
-
-        TextView appName = new TextView(this);
-        appName.setText("白沫播放器");
-        appName.setTextColor(Color.WHITE);
-        appName.setTextSize(20);
-        appName.setGravity(Gravity.CENTER_VERTICAL);
-        top.addView(appName, new LinearLayout.LayoutParams(0, -1, 1));
+        top.setPadding(dp(24), 0, dp(24), 0);
+        page.addView(top, new LinearLayout.LayoutParams(-1, dp(42)));
 
         backButton = new Button(this);
         backButton.setText("返回");
@@ -171,36 +266,37 @@ public class MainActivity extends Activity {
         backButton.setOnClickListener(v -> goBackPage());
         top.addView(backButton, new LinearLayout.LayoutParams(dp(72), dp(40)));
 
-        Button openButton = new Button(this);
-        openButton.setText("选择文件夹");
-        openButton.setTextColor(Color.WHITE);
-        openButton.setTextSize(14);
-        openButton.setAllCaps(false);
-        openButton.setBackgroundResource(R.drawable.button_primary);
-        openButton.setOnClickListener(v -> openFolderPicker());
-        LinearLayout.LayoutParams openParams = new LinearLayout.LayoutParams(dp(112), dp(40));
-        openParams.leftMargin = dp(8);
-        top.addView(openButton, openParams);
+        TextView topSpacer = new TextView(this);
+        top.addView(topSpacer, new LinearLayout.LayoutParams(0, -1, 1));
 
         LinearLayout sectionHeader = new LinearLayout(this);
         sectionHeader.setOrientation(LinearLayout.VERTICAL);
-        sectionHeader.setPadding(0, dp(18), 0, dp(4));
-        page.addView(sectionHeader, new LinearLayout.LayoutParams(-1, dp(82)));
+        sectionHeader.setGravity(Gravity.CENTER_HORIZONTAL);
+        sectionHeader.setPadding(dp(24), dp(18), dp(24), dp(8));
+        page.addView(sectionHeader, new LinearLayout.LayoutParams(-1, dp(112)));
 
         sectionTitleView = label("作品列表", 22, Color.WHITE);
         sectionTitleView.setSingleLine(true);
         sectionTitleView.setEllipsize(TextUtils.TruncateAt.END);
+        sectionTitleView.setGravity(Gravity.CENTER);
         sectionHeader.addView(sectionTitleView, new LinearLayout.LayoutParams(-1, 0, 1));
 
         sectionSubtitleView = label("请选择文件夹，自动识别 ASMR 作品", 13, Color.rgb(184, 193, 202));
         sectionSubtitleView.setSingleLine(true);
         sectionSubtitleView.setEllipsize(TextUtils.TruncateAt.END);
+        sectionSubtitleView.setGravity(Gravity.CENTER);
         sectionHeader.addView(sectionSubtitleView, new LinearLayout.LayoutParams(-1, 0, 1));
+
+        contentPanel = new LinearLayout(this);
+        contentPanel.setOrientation(LinearLayout.VERTICAL);
+        contentPanel.setPadding(dp(18), dp(14), dp(18), dp(10));
+        contentPanel.setBackgroundResource(R.drawable.content_panel);
+        page.addView(contentPanel, new LinearLayout.LayoutParams(-1, 0, 1));
 
         playerArea = new LinearLayout(this);
         playerArea.setOrientation(LinearLayout.VERTICAL);
         playerArea.setVisibility(View.GONE);
-        page.addView(playerArea, new LinearLayout.LayoutParams(-1, 0, 1.45f));
+        contentPanel.addView(playerArea, new LinearLayout.LayoutParams(-1, 0, 1));
 
         coverView = new ImageView(this);
         coverView.setBackgroundColor(Color.rgb(31, 35, 41));
@@ -306,51 +402,75 @@ public class MainActivity extends Activity {
         meta.addView(statusView, new LinearLayout.LayoutParams(0, -1, 1));
 
         browserList = new ListView(this);
-        browserList.setDivider(new ColorDrawable(Color.rgb(45, 51, 59)));
-        browserList.setDividerHeight(1);
+        browserList.setDivider(new ColorDrawable(Color.TRANSPARENT));
+        browserList.setDividerHeight(dp(8));
         browserList.setCacheColorHint(Color.TRANSPARENT);
         browserList.setBackgroundColor(Color.TRANSPARENT);
         browserList.setClipToPadding(false);
-        browserList.setPadding(0, dp(16), 0, dp(20));
+        browserList.setScrollingCacheEnabled(false);
+        browserList.setSmoothScrollbarEnabled(true);
+        browserList.setPadding(0, dp(6), 0, dp(12));
         browserList.setAdapter(browserAdapter);
         browserList.setOnItemClickListener(this::onListItemClick);
         browserList.setOnItemLongClickListener((parent, view, position, id) -> onListItemLongClick(position));
         browserList.setOnTouchListener((v, event) -> handleListDrag(event));
-        page.addView(browserList, new LinearLayout.LayoutParams(-1, 0, 1.7f));
+        contentPanel.addView(browserList, new LinearLayout.LayoutParams(-1, 0, 1));
 
         lyricsList = new ListView(this);
-        lyricsList.setDivider(new ColorDrawable(Color.rgb(45, 51, 59)));
-        lyricsList.setDividerHeight(1);
+        lyricsList.setDivider(new ColorDrawable(Color.TRANSPARENT));
+        lyricsList.setDividerHeight(dp(8));
         lyricsList.setCacheColorHint(Color.TRANSPARENT);
         lyricsList.setBackgroundColor(Color.TRANSPARENT);
         lyricsList.setClipToPadding(false);
-        lyricsList.setPadding(0, dp(16), 0, dp(24));
+        lyricsList.setScrollingCacheEnabled(false);
+        lyricsList.setSmoothScrollbarEnabled(true);
+        lyricsList.setPadding(0, dp(6), 0, dp(12));
         lyricsList.setVisibility(View.GONE);
         lyricsList.setAdapter(lyricsAdapter);
         lyricsList.setOnItemClickListener((parent, view, position, id) -> seekToCue(position));
-        page.addView(lyricsList, new LinearLayout.LayoutParams(-1, 0, 1.7f));
+        contentPanel.addView(lyricsList, new LinearLayout.LayoutParams(-1, 0, 1));
+
+        recentList = new ListView(this);
+        recentList.setDivider(new ColorDrawable(Color.TRANSPARENT));
+        recentList.setDividerHeight(dp(8));
+        recentList.setCacheColorHint(Color.TRANSPARENT);
+        recentList.setBackgroundColor(Color.TRANSPARENT);
+        recentList.setClipToPadding(false);
+        recentList.setScrollingCacheEnabled(false);
+        recentList.setSmoothScrollbarEnabled(true);
+        recentList.setPadding(0, dp(6), 0, dp(12));
+        recentList.setVisibility(View.GONE);
+        recentList.setAdapter(recentAdapter);
+        recentList.setOnItemClickListener((parent, view, position, id) -> openRecentTrack(recentTracks.get(position)));
+        contentPanel.addView(recentList, new LinearLayout.LayoutParams(-1, 0, 1));
+
+        settingsArea = buildSettingsArea();
+        settingsArea.setVisibility(View.GONE);
+        contentPanel.addView(settingsArea, new LinearLayout.LayoutParams(-1, 0, 1));
 
         miniPlayer = new LinearLayout(this);
         miniPlayer.setOrientation(LinearLayout.VERTICAL);
-        miniPlayer.setPadding(dp(10), dp(8), dp(10), dp(8));
-        miniPlayer.setBackgroundResource(R.drawable.panel);
+        miniPlayer.setPadding(dp(12), dp(6), dp(12), dp(4));
+        miniPlayer.setBackgroundResource(R.drawable.mini_pill);
         miniPlayer.setVisibility(View.GONE);
         miniPlayer.setOnClickListener(v -> showPlayer());
-        LinearLayout.LayoutParams miniParams = new LinearLayout.LayoutParams(-1, dp(104));
-        miniParams.topMargin = dp(10);
-        page.addView(miniPlayer, miniParams);
+        LinearLayout.LayoutParams miniParams = new LinearLayout.LayoutParams(-1, dp(62));
+        miniParams.leftMargin = dp(10);
+        miniParams.rightMargin = dp(10);
+        miniParams.topMargin = dp(6);
+        contentPanel.addView(miniPlayer, miniParams);
 
         LinearLayout miniTop = new LinearLayout(this);
         miniTop.setOrientation(LinearLayout.HORIZONTAL);
         miniTop.setGravity(Gravity.CENTER_VERTICAL);
-        miniPlayer.addView(miniTop, new LinearLayout.LayoutParams(-1, dp(40)));
+        miniPlayer.addView(miniTop, new LinearLayout.LayoutParams(-1, dp(42)));
 
-        miniTitleView = label("未播放", 13, Color.rgb(236, 240, 243));
+        miniTitleView = label("未播放", 14, Color.rgb(20, 24, 35));
         miniTitleView.setSingleLine(true);
         miniTitleView.setEllipsize(TextUtils.TruncateAt.END);
         miniTop.addView(miniTitleView, new LinearLayout.LayoutParams(0, -1, 1));
 
-        miniTop.addView(iconButton("⏮", v -> playRelative(-1, false)), new LinearLayout.LayoutParams(dp(42), dp(36)));
+        miniTop.addView(iconButton("⏮", v -> playRelative(-1, false)), new LinearLayout.LayoutParams(dp(38), dp(34)));
         miniPlayButton = new Button(this);
         miniPlayButton.setText(ICON_PAUSE);
         miniPlayButton.setTextColor(Color.WHITE);
@@ -358,11 +478,11 @@ public class MainActivity extends Activity {
         miniPlayButton.setAllCaps(false);
         miniPlayButton.setBackgroundResource(R.drawable.button_primary);
         miniPlayButton.setOnClickListener(v -> togglePlayback());
-        LinearLayout.LayoutParams miniPlayParams = new LinearLayout.LayoutParams(dp(64), dp(36));
+        LinearLayout.LayoutParams miniPlayParams = new LinearLayout.LayoutParams(dp(52), dp(34));
         miniPlayParams.leftMargin = dp(6);
         miniPlayParams.rightMargin = dp(6);
         miniTop.addView(miniPlayButton, miniPlayParams);
-        miniTop.addView(iconButton("⏭", v -> playRelative(1, false)), new LinearLayout.LayoutParams(dp(42), dp(36)));
+        miniTop.addView(iconButton("⏭", v -> playRelative(1, false)), new LinearLayout.LayoutParams(dp(38), dp(34)));
 
         miniSeekBar = new SeekBar(this);
         miniSeekBar.setProgressDrawable(getDrawable(R.drawable.seekbar_progress));
@@ -370,13 +490,207 @@ public class MainActivity extends Activity {
             showPlayer();
             return true;
         });
-        miniPlayer.addView(miniSeekBar, new LinearLayout.LayoutParams(-1, dp(34)));
+        miniPlayer.addView(miniSeekBar, new LinearLayout.LayoutParams(-1, dp(8)));
 
-        miniTimeView = label("00:00 / 00:00", 12, Color.rgb(184, 193, 202));
+        miniTimeView = label("00:00 / 00:00", 1, Color.TRANSPARENT);
         miniTimeView.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
-        miniPlayer.addView(miniTimeView, new LinearLayout.LayoutParams(-1, 0, 1));
+        miniPlayer.addView(miniTimeView, new LinearLayout.LayoutParams(-1, 0, 0));
 
+        bottomNav = new LinearLayout(this);
+        bottomNav.setOrientation(LinearLayout.HORIZONTAL);
+        bottomNav.setGravity(Gravity.CENTER);
+        bottomNav.setPadding(dp(2), dp(2), dp(2), dp(2));
+        bottomNav.setBackgroundColor(Color.TRANSPARENT);
+        heardTabButton = navButton("听过", TAB_HEARD);
+        myTabButton = navButton("我的", TAB_MY);
+        settingsTabButton = navButton("设置", TAB_SETTINGS);
+        bottomNav.addView(heardTabButton, navButtonParams());
+        bottomNav.addView(myTabButton, navButtonParams());
+        bottomNav.addView(settingsTabButton, navButtonParams());
+        LinearLayout.LayoutParams navParams = new LinearLayout.LayoutParams(-1, dp(44));
+        navParams.topMargin = dp(4);
+        contentPanel.addView(bottomNav, navParams);
+
+        updatePageChrome(false);
         setContentView(root);
+    }
+
+    private void hideSystemBars() {
+        Window window = getWindow();
+        View decorView = window.getDecorView();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            WindowInsetsController controller = decorView.getWindowInsetsController();
+            if (controller != null) {
+                controller.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+                controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            }
+        } else {
+            decorView.setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                            | View.SYSTEM_UI_FLAG_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                            | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            );
+        }
+    }
+
+    private LinearLayout buildFindArea() {
+        LinearLayout area = new LinearLayout(this);
+        area.setOrientation(LinearLayout.VERTICAL);
+        area.setPadding(0, dp(4), 0, 0);
+
+        LinearLayout urlRow = new LinearLayout(this);
+        urlRow.setOrientation(LinearLayout.HORIZONTAL);
+        urlRow.setGravity(Gravity.CENTER_VERTICAL);
+        area.addView(urlRow, new LinearLayout.LayoutParams(-1, dp(42)));
+
+        urlInput = new EditText(this);
+        urlInput.setSingleLine(true);
+        urlInput.setTextColor(Color.WHITE);
+        urlInput.setHintTextColor(Color.rgb(137, 146, 156));
+        urlInput.setTextSize(14);
+        urlInput.setHint("输入网址，例如 https://example.com");
+        urlInput.setPadding(dp(12), 0, dp(12), 0);
+        urlInput.setBackgroundResource(R.drawable.button_icon);
+        urlRow.addView(urlInput, new LinearLayout.LayoutParams(0, dp(38), 1));
+
+        Button goButton = drawerButton("前往");
+        goButton.setOnClickListener(v -> loadBrowserUrl(urlInput.getText().toString()));
+        LinearLayout.LayoutParams goParams = new LinearLayout.LayoutParams(dp(64), dp(38));
+        goParams.leftMargin = dp(8);
+        urlRow.addView(goButton, goParams);
+
+        webView = new WebView(this);
+        WebSettings settings = webView.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setLoadWithOverviewMode(false);
+        settings.setUseWideViewPort(false);
+        settings.setTextZoom(100);
+        settings.setLoadsImagesAutomatically(true);
+        settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        }
+        webView.setBackgroundColor(Color.rgb(24, 27, 32));
+        webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                urlInput.setText(url);
+                addWebHistory(url);
+            }
+
+            @Override
+            public void onReceivedError(WebView view, int errorCode, String description, String failingUrl) {
+                super.onReceivedError(view, errorCode, description, failingUrl);
+                Toast.makeText(MainActivity.this, "网页加载失败: " + description, Toast.LENGTH_SHORT).show();
+            }
+        });
+        LinearLayout.LayoutParams webParams = new LinearLayout.LayoutParams(-1, 0, 1);
+        webParams.topMargin = dp(6);
+        area.addView(webView, webParams);
+
+        TextView historyTitle = label("访问记录", 13, Color.rgb(184, 193, 202));
+        LinearLayout.LayoutParams historyTitleParams = new LinearLayout.LayoutParams(-1, dp(22));
+        historyTitleParams.topMargin = dp(4);
+        area.addView(historyTitle, historyTitleParams);
+
+        webHistoryList = new ListView(this);
+        webHistoryList.setDivider(new ColorDrawable(Color.rgb(45, 51, 59)));
+        webHistoryList.setDividerHeight(1);
+        webHistoryList.setCacheColorHint(Color.TRANSPARENT);
+        webHistoryList.setBackgroundColor(Color.TRANSPARENT);
+        webHistoryList.setAdapter(webHistoryAdapter);
+        webHistoryList.setOnItemClickListener((parent, view, position, id) -> loadBrowserUrl(webHistory.get(position)));
+        area.addView(webHistoryList, new LinearLayout.LayoutParams(-1, dp(62)));
+        return area;
+    }
+
+    private LinearLayout buildSettingsArea() {
+        LinearLayout area = new LinearLayout(this);
+        area.setOrientation(LinearLayout.VERTICAL);
+        area.setPadding(0, dp(18), 0, dp(12));
+
+        Button chooseFolder = drawerButton("选择文件");
+        chooseFolder.setOnClickListener(v -> openFolderPicker());
+        area.addView(chooseFolder, new LinearLayout.LayoutParams(-1, dp(50)));
+
+        floatingLyricsButton = drawerButton("台词悬浮");
+        floatingLyricsButton.setOnClickListener(v -> toggleFloatingLyrics());
+        LinearLayout.LayoutParams floatingParams = new LinearLayout.LayoutParams(-1, dp(50));
+        floatingParams.topMargin = dp(10);
+        area.addView(floatingLyricsButton, floatingParams);
+
+        TextView hint = label("台词悬浮开启后会显示在手机页面上层，切到后台也会继续播放并更新台词，可拖动调整位置。", 13, Color.rgb(160, 169, 178));
+        hint.setMaxLines(4);
+        LinearLayout.LayoutParams hintParams = new LinearLayout.LayoutParams(-1, -2);
+        hintParams.topMargin = dp(14);
+        area.addView(hint, hintParams);
+        return area;
+    }
+
+    private Button navButton(String text, int tab) {
+        Button button = new Button(this);
+        button.setText(text);
+        button.setTextSize(13);
+        button.setAllCaps(false);
+        button.setMinWidth(0);
+        button.setMinimumWidth(0);
+        button.setPadding(0, 0, 0, 0);
+        button.setOnClickListener(v -> showMainTab(tab));
+        return button;
+    }
+
+    private LinearLayout.LayoutParams navButtonParams() {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -1, 1);
+        params.leftMargin = dp(2);
+        params.rightMargin = dp(2);
+        return params;
+    }
+
+    private void buildSettingsDrawer(FrameLayout root) {
+        drawerScrim = new View(this);
+        drawerScrim.setBackgroundColor(Color.argb(130, 0, 0, 0));
+        drawerScrim.setVisibility(View.GONE);
+        drawerScrim.setOnClickListener(v -> hideSettingsDrawer());
+        root.addView(drawerScrim, new FrameLayout.LayoutParams(-1, -1));
+
+        settingsDrawer = new LinearLayout(this);
+        settingsDrawer.setOrientation(LinearLayout.VERTICAL);
+        settingsDrawer.setPadding(dp(18), dp(28), dp(18), dp(18));
+        settingsDrawer.setBackgroundColor(Color.rgb(24, 27, 32));
+        settingsDrawer.setVisibility(View.GONE);
+
+        TextView title = label("设置", 20, Color.WHITE);
+        title.setGravity(Gravity.CENTER_VERTICAL);
+        settingsDrawer.addView(title, new LinearLayout.LayoutParams(-1, dp(44)));
+
+        Button chooseFolder = drawerButton("选择文件");
+        chooseFolder.setOnClickListener(v -> {
+            hideSettingsDrawer();
+            openFolderPicker();
+        });
+        LinearLayout.LayoutParams chooseParams = new LinearLayout.LayoutParams(-1, dp(48));
+        chooseParams.topMargin = dp(12);
+        settingsDrawer.addView(chooseFolder, chooseParams);
+
+        floatingLyricsButton = drawerButton("台词悬浮");
+        floatingLyricsButton.setOnClickListener(v -> toggleFloatingLyrics());
+        LinearLayout.LayoutParams floatingParams = new LinearLayout.LayoutParams(-1, dp(48));
+        floatingParams.topMargin = dp(10);
+        settingsDrawer.addView(floatingLyricsButton, floatingParams);
+
+        TextView hint = label("开启后台词会显示在手机页面上层，可拖动位置。", 12, Color.rgb(160, 169, 178));
+        hint.setMaxLines(3);
+        LinearLayout.LayoutParams hintParams = new LinearLayout.LayoutParams(-1, -2);
+        hintParams.topMargin = dp(12);
+        settingsDrawer.addView(hint, hintParams);
+
+        FrameLayout.LayoutParams drawerParams = new FrameLayout.LayoutParams(dp(260), -1, Gravity.END);
+        root.addView(settingsDrawer, drawerParams);
     }
 
     private LinearLayout panel() {
@@ -394,6 +708,40 @@ public class MainActivity extends Activity {
         view.setTextColor(color);
         view.setGravity(Gravity.CENTER_VERTICAL);
         return view;
+    }
+
+    private Button drawerButton(String text) {
+        Button button = new Button(this);
+        button.setText(text);
+        button.setTextColor(Color.WHITE);
+        button.setTextSize(15);
+        button.setAllCaps(false);
+        button.setGravity(Gravity.CENTER_VERTICAL);
+        button.setPadding(dp(14), 0, dp(14), 0);
+        button.setBackgroundResource(R.drawable.button_icon);
+        return button;
+    }
+
+    private void showSettingsDrawer() {
+        if (settingsDrawer == null || drawerScrim == null) {
+            return;
+        }
+        updateFloatingLyricsButton();
+        drawerScrim.setVisibility(View.VISIBLE);
+        settingsDrawer.setVisibility(View.VISIBLE);
+        settingsDrawer.setTranslationX(dp(260));
+        settingsDrawer.animate().translationX(0).setDuration(180).start();
+    }
+
+    private void hideSettingsDrawer() {
+        if (settingsDrawer == null || drawerScrim == null || settingsDrawer.getVisibility() != View.VISIBLE) {
+            return;
+        }
+        settingsDrawer.animate().translationX(dp(260)).setDuration(160).withEndAction(() -> {
+            settingsDrawer.setVisibility(View.GONE);
+            drawerScrim.setVisibility(View.GONE);
+            settingsDrawer.setTranslationX(0);
+        }).start();
     }
 
     private LinearLayout.LayoutParams buttonParams() {
@@ -421,9 +769,321 @@ public class MainActivity extends Activity {
         startActivityForResult(intent, REQ_OPEN_TREE);
     }
 
+    private void toggleFloatingLyrics() {
+        hideSettingsDrawer();
+        if (!floatingLyricsEnabled) {
+            floatingLyricsEnabled = true;
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_FLOATING_LYRICS, true).apply();
+            if (canDrawOverlays()) {
+                showFloatingLyrics();
+                Toast.makeText(this, "台词悬浮已开启", Toast.LENGTH_SHORT).show();
+            } else {
+                requestOverlayPermission();
+            }
+        } else {
+            floatingLyricsEnabled = false;
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_FLOATING_LYRICS, false).apply();
+            hideFloatingLyrics();
+            Toast.makeText(this, "台词悬浮已关闭", Toast.LENGTH_SHORT).show();
+        }
+        updateFloatingLyricsButton();
+    }
+
+    private void updateFloatingLyricsButton() {
+        if (floatingLyricsButton == null) {
+            return;
+        }
+        floatingLyricsButton.setText(floatingLyricsEnabled ? "台词悬浮  开" : "台词悬浮  关");
+    }
+
+    private boolean canDrawOverlays() {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this);
+    }
+
+    private void requestOverlayPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return;
+        }
+        Toast.makeText(this, "请允许白沫播放器显示在其他应用上层", Toast.LENGTH_LONG).show();
+        Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:" + getPackageName()));
+        startActivityForResult(intent, REQ_OVERLAY_PERMISSION);
+    }
+
+    private void showFloatingLyrics() {
+        if (!floatingLyricsEnabled || !canDrawOverlays()) {
+            return;
+        }
+        if (floatingLyricView != null) {
+            updateFloatingLyricText();
+            return;
+        }
+        windowManager = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+        if (windowManager == null) {
+            return;
+        }
+        floatingLyricView = new TextView(this);
+        floatingLyricView.setTextColor(Color.WHITE);
+        floatingLyricView.setTextSize(15);
+        floatingLyricView.setGravity(Gravity.CENTER);
+        floatingLyricView.setPadding(dp(14), dp(10), dp(14), dp(10));
+        floatingLyricView.setMaxLines(4);
+        floatingLyricView.setBackgroundColor(Color.argb(150, 16, 18, 21));
+        floatingLyricView.setText("台词悬浮已开启");
+        floatingLyricView.setOnTouchListener(new View.OnTouchListener() {
+            private int startX;
+            private int startY;
+            private float downX;
+            private float downY;
+
+            @Override
+            public boolean onTouch(View view, MotionEvent event) {
+                if (floatingLyricParams == null || windowManager == null) {
+                    return false;
+                }
+                if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                    startX = floatingLyricParams.x;
+                    startY = floatingLyricParams.y;
+                    downX = event.getRawX();
+                    downY = event.getRawY();
+                    return true;
+                }
+                if (event.getAction() == MotionEvent.ACTION_MOVE) {
+                    floatingLyricParams.x = startX + (int) (event.getRawX() - downX);
+                    floatingLyricParams.y = startY + (int) (event.getRawY() - downY);
+                    windowManager.updateViewLayout(floatingLyricView, floatingLyricParams);
+                    return true;
+                }
+                return true;
+            }
+        });
+
+        int overlayType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                : WindowManager.LayoutParams.TYPE_PHONE;
+        floatingLyricParams = new WindowManager.LayoutParams(
+                dp(300),
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                overlayType,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT);
+        floatingLyricParams.gravity = Gravity.TOP | Gravity.START;
+        floatingLyricParams.x = dp(28);
+        floatingLyricParams.y = dp(120);
+        try {
+            windowManager.addView(floatingLyricView, floatingLyricParams);
+            updateFloatingLyricText();
+        } catch (Exception ex) {
+            floatingLyricView = null;
+            Toast.makeText(this, "无法显示悬浮台词: " + ex.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void hideFloatingLyrics() {
+        if (floatingLyricView == null || windowManager == null) {
+            floatingLyricView = null;
+            return;
+        }
+        try {
+            windowManager.removeView(floatingLyricView);
+        } catch (Exception ignored) {
+        }
+        floatingLyricView = null;
+        floatingLyricParams = null;
+    }
+
+    private void updateFloatingLyricText() {
+        if (floatingLyricView == null) {
+            return;
+        }
+        CharSequence text = lyricView == null ? "" : lyricView.getText();
+        if (TextUtils.isEmpty(text)) {
+            MediaItem current = currentPlaybackItem();
+            if (current != null) {
+                text = current.audio.name;
+            } else {
+                text = "等待播放台词";
+            }
+        }
+        floatingLyricView.setText(text);
+    }
+
+    private void loadBrowserUrl(String rawUrl) {
+        String url = normalizeUrl(rawUrl);
+        if (TextUtils.isEmpty(url)) {
+            Toast.makeText(this, "请输入网址", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        urlInput.setText(url);
+        webView.loadUrl(url);
+    }
+
+    private String normalizeUrl(String rawUrl) {
+        String url = rawUrl == null ? "" : rawUrl.trim();
+        if (TextUtils.isEmpty(url)) {
+            return "";
+        }
+        String lower = url.toLowerCase(Locale.ROOT);
+        if (!lower.startsWith("http://") && !lower.startsWith("https://")) {
+            url = "https://" + url;
+        }
+        return url;
+    }
+
+    private void loadWebHistory() {
+        webHistory.clear();
+        String raw = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_WEB_HISTORY, "[]");
+        try {
+            JSONArray array = new JSONArray(raw);
+            for (int i = 0; i < array.length(); i++) {
+                String url = array.optString(i, "");
+                if (!TextUtils.isEmpty(url)) {
+                    webHistory.add(url);
+                }
+            }
+        } catch (JSONException ignored) {
+        }
+        webHistoryAdapter.notifyDataSetChanged();
+    }
+
+    private void addWebHistory(String url) {
+        if (TextUtils.isEmpty(url) || url.startsWith("about:")) {
+            return;
+        }
+        webHistory.remove(url);
+        webHistory.add(0, url);
+        while (webHistory.size() > 50) {
+            webHistory.remove(webHistory.size() - 1);
+        }
+        saveWebHistory();
+        webHistoryAdapter.notifyDataSetChanged();
+    }
+
+    private void saveWebHistory() {
+        JSONArray array = new JSONArray();
+        for (String url : webHistory) {
+            array.put(url);
+        }
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(KEY_WEB_HISTORY, array.toString())
+                .apply();
+    }
+
+    private void loadRecentTracks() {
+        recentTracks.clear();
+        String raw = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_RECENT_AUDIO, "[]");
+        try {
+            JSONArray array = new JSONArray(raw);
+            for (int i = 0; i < array.length(); i++) {
+                JSONObject object = array.getJSONObject(i);
+                recentTracks.add(new RecentTrack(
+                        object.optString("workKey", ""),
+                        object.optString("trackKey", ""),
+                        object.optString("workName", ""),
+                        object.optString("trackName", "")
+                ));
+            }
+        } catch (JSONException ignored) {
+        }
+        recentAdapter.notifyDataSetChanged();
+    }
+
+    private void recordRecentTrack(MediaItem item, WorkItem work) {
+        if (item == null) {
+            return;
+        }
+        String workKey = work == null ? "" : work.key;
+        String workName = work == null ? item.audio.parentPath : work.name;
+        for (int i = recentTracks.size() - 1; i >= 0; i--) {
+            RecentTrack recent = recentTracks.get(i);
+            if (recent.trackKey.equals(item.key) && recent.workKey.equals(workKey)) {
+                recentTracks.remove(i);
+            }
+        }
+        recentTracks.add(0, new RecentTrack(workKey, item.key, workName, item.audio.name));
+        while (recentTracks.size() > 80) {
+            recentTracks.remove(recentTracks.size() - 1);
+        }
+        saveRecentTracks();
+        recentAdapter.notifyDataSetChanged();
+        if (currentTab == TAB_HEARD) {
+            sectionSubtitleView.setText("近期播放 " + recentTracks.size() + " 条");
+        }
+    }
+
+    private void saveRecentTracks() {
+        JSONArray array = new JSONArray();
+        try {
+            for (RecentTrack recent : recentTracks) {
+                JSONObject object = new JSONObject();
+                object.put("workKey", recent.workKey);
+                object.put("trackKey", recent.trackKey);
+                object.put("workName", recent.workName);
+                object.put("trackName", recent.trackName);
+                array.put(object);
+            }
+        } catch (JSONException ignored) {
+        }
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(KEY_RECENT_AUDIO, array.toString())
+                .apply();
+    }
+
+    private void openRecentTrack(RecentTrack recent) {
+        WorkItem work = findWorkByKey(recent.workKey);
+        if (work == null) {
+            Toast.makeText(this, "未找到该音频所在作品，请重新选择文件夹扫描", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        int trackIndex = findTrackIndex(work, recent.trackKey);
+        if (trackIndex < 0) {
+            Toast.makeText(this, "未找到该音频文件", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        MediaItem current = currentPlaybackItem();
+        if (current != null && current.key.equals(recent.trackKey) && playbackWork != null && playbackWork.key.equals(work.key)) {
+            showPlayer();
+            return;
+        }
+        showMainTab(TAB_MY);
+        openWork(work);
+        playAt(trackIndex, true);
+    }
+
+    private WorkItem findWorkByKey(String key) {
+        for (WorkItem work : works) {
+            if (work.key.equals(key)) {
+                return work;
+            }
+        }
+        return null;
+    }
+
+    private int findTrackIndex(WorkItem work, String trackKey) {
+        for (int i = 0; i < work.tracks.size(); i++) {
+            if (work.tracks.get(i).key.equals(trackKey)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_OVERLAY_PERMISSION) {
+            if (floatingLyricsEnabled && canDrawOverlays()) {
+                showFloatingLyrics();
+                Toast.makeText(this, "台词悬浮已开启", Toast.LENGTH_SHORT).show();
+            } else if (floatingLyricsEnabled) {
+                floatingLyricsEnabled = false;
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_FLOATING_LYRICS, false).apply();
+                updateFloatingLyricsButton();
+            }
+            return;
+        }
         if (requestCode == REQ_OPEN_TREE && resultCode == RESULT_OK && data != null) {
             Uri uri = data.getData();
             if (uri == null) {
@@ -436,16 +1096,24 @@ public class MainActivity extends Activity {
     }
 
     private void scanFolder(Uri treeUri, List<WorkItem> cachedOrder) {
+        currentTab = TAB_MY;
+        boolean keepPlayback = currentPlaybackItem() != null;
         works.clear();
-        playlist.clear();
-        cues.clear();
-        activeWork = null;
-        currentIndex = -1;
+        if (!keepPlayback) {
+            playlist.clear();
+            playbackQueue.clear();
+            cues.clear();
+            activeWork = null;
+            playbackWork = null;
+            currentIndex = -1;
+        }
         movingWorkIndex = -1;
         movingTrackIndex = -1;
         draggingListItem = false;
-        releasePlayer();
-        resetPlaybackUi();
+        if (!keepPlayback) {
+            releasePlayer();
+            resetPlaybackUi();
+        }
         updateMiniPlayer();
 
         String treeDocumentId = DocumentsContract.getTreeDocumentId(treeUri);
@@ -554,6 +1222,7 @@ public class MainActivity extends Activity {
             playlist.clear();
             cues.clear();
             activeWork = null;
+            playbackWork = null;
             currentIndex = -1;
             movingWorkIndex = -1;
             movingTrackIndex = -1;
@@ -566,6 +1235,7 @@ public class MainActivity extends Activity {
                     works.add(work);
                 }
             }
+            currentTab = TAB_MY;
             pageMode = PAGE_WORKS;
             browserAdapter.notifyDataSetChanged();
             updatePageChrome(false);
@@ -875,12 +1545,16 @@ public class MainActivity extends Activity {
             activeWork.tracks.clear();
             activeWork.tracks.addAll(playlist);
         }
-        if (currentIndex == from) {
-            currentIndex = to;
-        } else if (from < currentIndex && to >= currentIndex) {
-            currentIndex--;
-        } else if (from > currentIndex && to <= currentIndex) {
-            currentIndex++;
+        if (activeWork != null && activeWork == playbackWork && playbackQueue.size() == playlist.size()) {
+            playbackQueue.clear();
+            playbackQueue.addAll(playlist);
+            if (currentIndex == from) {
+                currentIndex = to;
+            } else if (from < currentIndex && to >= currentIndex) {
+                currentIndex--;
+            } else if (from > currentIndex && to <= currentIndex) {
+                currentIndex++;
+            }
         }
         movingTrackIndex = to;
         browserAdapter.notifyDataSetChanged();
@@ -889,11 +1563,7 @@ public class MainActivity extends Activity {
     }
 
     private void openWork(WorkItem work) {
-        WorkItem previousWork = activeWork;
-        boolean keepCurrentPlayback = player != null && currentIndex >= 0 && previousWork == work;
-        if (player != null && !keepCurrentPlayback) {
-            releasePlayer();
-        }
+        currentTab = TAB_MY;
         activeWork = work;
         movingWorkIndex = -1;
         movingTrackIndex = -1;
@@ -903,7 +1573,7 @@ public class MainActivity extends Activity {
         pageMode = PAGE_TRACKS;
         updatePageChrome(true);
         browserAdapter.notifyDataSetChanged();
-        if (!keepCurrentPlayback) {
+        if (player == null) {
             currentIndex = -1;
             resetPlaybackUi();
         }
@@ -920,6 +1590,7 @@ public class MainActivity extends Activity {
     }
 
     private void showWorks() {
+        currentTab = TAB_MY;
         pageMode = PAGE_WORKS;
         movingWorkIndex = -1;
         movingTrackIndex = -1;
@@ -938,6 +1609,7 @@ public class MainActivity extends Activity {
     }
 
     private void showTracks() {
+        currentTab = TAB_MY;
         if (activeWork == null) {
             showWorks();
             return;
@@ -952,7 +1624,8 @@ public class MainActivity extends Activity {
         sectionSubtitleView.setText("音轨列表");
         titleView.setText(activeWork.name);
         folderView.setText(activeWork.tracks.size() + " 首音轨");
-        lyricView.setText(currentIndex >= 0 ? "正在播放: " + playlist.get(currentIndex).audio.name : "点击音轨进入播放页");
+        MediaItem current = currentPlaybackItem();
+        lyricView.setText(current == null ? "点击音轨进入播放页" : "正在播放: " + current.audio.name);
         statusView.setText(currentIndex >= 0 && player != null && player.isPlaying() ? "播放中" : "音轨列表");
         if (activeWork.cover != null) {
             coverView.setImageURI(activeWork.cover.uri);
@@ -961,11 +1634,18 @@ public class MainActivity extends Activity {
     }
 
     private void showPlayer() {
+        currentTab = TAB_MY;
         pageMode = PAGE_PLAYER;
         updatePageChrome(true);
         browserAdapter.notifyDataSetChanged();
         sectionTitleView.setText("正在播放");
-        sectionSubtitleView.setText(activeWork == null ? "" : activeWork.name);
+        MediaItem current = currentPlaybackItem();
+        sectionSubtitleView.setText(playbackWork == null ? "" : playbackWork.name);
+        if (current != null) {
+            titleView.setText(current.audio.name);
+            folderView.setText(playbackWork == null ? current.audio.parentPath : playbackWork.name);
+            showCurrentTrackImage();
+        }
         updateMiniPlayer();
     }
 
@@ -974,11 +1654,13 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "当前音轨没有可查看的 .vtt 台词", Toast.LENGTH_SHORT).show();
             return;
         }
+        currentTab = TAB_MY;
         pageMode = PAGE_LYRICS;
         updatePageChrome(true);
         lyricsAdapter.notifyDataSetChanged();
         sectionTitleView.setText("台词");
-        sectionSubtitleView.setText(currentIndex >= 0 ? playlist.get(currentIndex).audio.name : "点击台词跳转播放位置");
+        MediaItem current = currentPlaybackItem();
+        sectionSubtitleView.setText(current == null ? "点击台词跳转播放位置" : current.audio.name);
         if (currentCueIndex >= 0) {
             lyricsList.post(() -> lyricsList.smoothScrollToPosition(currentCueIndex));
         }
@@ -995,17 +1677,100 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void showMainTab(int tab) {
+        if (tab == TAB_MY) {
+            restoreMyTabFast();
+            return;
+        }
+        if (currentTab == tab) {
+            return;
+        }
+        currentTab = tab;
+        updatePageChrome(false);
+        if (tab == TAB_HEARD) {
+            sectionTitleView.setText("听过");
+            sectionSubtitleView.setText(recentTracks.isEmpty() ? "还没有播放记录" : "近期播放 " + recentTracks.size() + " 条");
+            recentAdapter.notifyDataSetChanged();
+        } else if (tab == TAB_SETTINGS) {
+            sectionTitleView.setText("设置");
+            sectionSubtitleView.setText("文件夹选择与台词悬浮");
+            updateFloatingLyricsButton();
+        }
+    }
+
+    private void restoreMyTabFast() {
+        currentTab = TAB_MY;
+        if ((pageMode == PAGE_TRACKS && activeWork == null)
+                || (pageMode == PAGE_PLAYER && currentPlaybackItem() == null)
+                || (pageMode == PAGE_LYRICS && cues.isEmpty())) {
+            pageMode = PAGE_WORKS;
+        }
+        updateMyHeaderFast();
+        updatePageChrome(false);
+    }
+
+    private void updateMyHeaderFast() {
+        if (pageMode == PAGE_WORKS) {
+            sectionTitleView.setText("作品列表");
+            sectionSubtitleView.setText(works.size() + " 个作品");
+            titleView.setText(works.isEmpty() ? "没有识别到 ASMR 音频作品" : "作品列表");
+            folderView.setText(works.size() + " 个作品");
+            lyricView.setText(works.isEmpty() ? "请选择包含 RJ 文件夹或音频文件的目录" : "点击作品查看音轨并播放");
+        } else if (pageMode == PAGE_TRACKS && activeWork != null) {
+            sectionTitleView.setText(activeWork.name);
+            sectionSubtitleView.setText("音轨列表");
+            titleView.setText(activeWork.name);
+            folderView.setText(activeWork.tracks.size() + " 首音轨");
+            MediaItem current = currentPlaybackItem();
+            lyricView.setText(current == null ? "点击音轨进入播放页" : "正在播放: " + current.audio.name);
+        } else if (pageMode == PAGE_PLAYER) {
+            MediaItem current = currentPlaybackItem();
+            sectionTitleView.setText("正在播放");
+            sectionSubtitleView.setText(playbackWork == null ? "" : playbackWork.name);
+            if (current != null) {
+                titleView.setText(current.audio.name);
+                folderView.setText(playbackWork == null ? current.audio.parentPath : playbackWork.name);
+            }
+        } else if (pageMode == PAGE_LYRICS) {
+            MediaItem current = currentPlaybackItem();
+            sectionTitleView.setText("台词");
+            sectionSubtitleView.setText(current == null ? "点击台词跳转播放位置" : current.audio.name);
+        }
+    }
+
+    private void updateBottomNav() {
+        configureNavButton(heardTabButton, currentTab == TAB_HEARD);
+        configureNavButton(myTabButton, currentTab == TAB_MY);
+        configureNavButton(settingsTabButton, currentTab == TAB_SETTINGS);
+    }
+
+    private void configureNavButton(Button button, boolean active) {
+        if (button == null) {
+            return;
+        }
+        button.setTextColor(active ? Color.rgb(18, 24, 38) : Color.rgb(124, 132, 144));
+        button.setBackgroundColor(Color.TRANSPARENT);
+        button.setTextSize(active ? 15 : 13);
+    }
+
     private void updatePageChrome(boolean animate) {
-        boolean playerVisible = pageMode == PAGE_PLAYER;
-        boolean lyricsVisible = pageMode == PAGE_LYRICS;
-        boolean listVisible = pageMode == PAGE_WORKS || pageMode == PAGE_TRACKS;
-        backButton.setVisibility(pageMode == PAGE_WORKS ? View.GONE : View.VISIBLE);
+        boolean myTab = currentTab == TAB_MY;
+        boolean playerVisible = myTab && pageMode == PAGE_PLAYER;
+        boolean lyricsVisible = myTab && pageMode == PAGE_LYRICS;
+        boolean listVisible = myTab && (pageMode == PAGE_WORKS || pageMode == PAGE_TRACKS);
+        backButton.setVisibility(myTab && pageMode != PAGE_WORKS ? View.VISIBLE : View.GONE);
         playerArea.setVisibility(playerVisible ? View.VISIBLE : View.GONE);
         browserList.setVisibility(listVisible ? View.VISIBLE : View.GONE);
         lyricsList.setVisibility(lyricsVisible ? View.VISIBLE : View.GONE);
+        recentList.setVisibility(currentTab == TAB_HEARD ? View.VISIBLE : View.GONE);
+        settingsArea.setVisibility(currentTab == TAB_SETTINGS ? View.VISIBLE : View.GONE);
+        updateBottomNav();
         updateMiniPlayer();
         if (animate) {
-            View target = playerVisible ? playerArea : (lyricsVisible ? lyricsList : browserList);
+            View target = playerVisible ? playerArea
+                    : (lyricsVisible ? lyricsList
+                    : (listVisible ? browserList
+                    : (currentTab == TAB_HEARD ? recentList : settingsArea)));
             target.setAlpha(0f);
             target.animate().alpha(1f).setDuration(180).start();
         }
@@ -1027,15 +1792,27 @@ public class MainActivity extends Activity {
         if (index < 0 || index >= playlist.size()) {
             return;
         }
+        playbackQueue.clear();
+        playbackQueue.addAll(playlist);
+        playbackWork = activeWork;
+        playFromQueue(index, openPlayerPage);
+    }
+
+    private void playFromQueue(int index, boolean openPlayerPage) {
+        if (index < 0 || index >= playbackQueue.size()) {
+            return;
+        }
         currentIndex = index;
         if (openPlayerPage) {
             showPlayer();
         }
         browserAdapter.notifyDataSetChanged();
-        MediaItem item = playlist.get(index);
+        MediaItem item = playbackQueue.get(index);
+        recordRecentTrack(item, playbackWork);
         titleView.setText(item.audio.name);
-        folderView.setText(activeWork == null ? item.audio.parentPath : activeWork.name);
+        folderView.setText(playbackWork == null ? item.audio.parentPath : playbackWork.name);
         lyricView.setText(item.vtt == null ? "未找到同名 .vtt 字幕" : "字幕已载入");
+        updateFloatingLyricText();
         currentImageIndex = 0;
         showCurrentTrackImage();
         loadCues(item.vtt);
@@ -1055,6 +1832,7 @@ public class MainActivity extends Activity {
                 handler.removeCallbacks(progressTick);
                 handler.post(progressTick);
                 updateMiniPlayer();
+                updateFloatingLyricText();
             });
             player.setOnCompletionListener(mp -> playRelative(1, pageMode == PAGE_PLAYER));
             player.prepareAsync();
@@ -1064,13 +1842,16 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "无法播放: " + ex.getMessage(), Toast.LENGTH_LONG).show();
             statusView.setText("播放失败");
             updateMiniPlayer();
+            updateFloatingLyricText();
         }
     }
 
     private void togglePlayback() {
         if (player == null) {
-            if (!playlist.isEmpty()) {
-                playAt(currentIndex >= 0 ? currentIndex : 0, true);
+            if (!playbackQueue.isEmpty()) {
+                playFromQueue(currentIndex >= 0 ? currentIndex : 0, true);
+            } else if (!playlist.isEmpty()) {
+                playAt(0, true);
             } else if (!works.isEmpty() && pageMode == PAGE_WORKS) {
                 openWork(works.get(0));
             }
@@ -1089,6 +1870,7 @@ public class MainActivity extends Activity {
             handler.post(progressTick);
         }
         updateMiniPlayer();
+        updateFloatingLyricText();
     }
 
     private void playRelative(int delta) {
@@ -1096,16 +1878,16 @@ public class MainActivity extends Activity {
     }
 
     private void playRelative(int delta, boolean openPlayerPage) {
-        if (playlist.isEmpty()) {
+        if (playbackQueue.isEmpty()) {
             return;
         }
         int next = currentIndex + delta;
         if (next < 0) {
-            next = playlist.size() - 1;
-        } else if (next >= playlist.size()) {
+            next = playbackQueue.size() - 1;
+        } else if (next >= playbackQueue.size()) {
             next = 0;
         }
-        playAt(next, openPlayerPage);
+        playFromQueue(next, openPlayerPage);
     }
 
     private void seekBy(int millis) {
@@ -1156,6 +1938,7 @@ public class MainActivity extends Activity {
         }
         if (activeIndex < 0) {
             lyricView.setText("");
+            updateFloatingLyricText();
             if (currentCueIndex != -1) {
                 currentCueIndex = -1;
                 lyricsAdapter.notifyDataSetChanged();
@@ -1165,6 +1948,7 @@ public class MainActivity extends Activity {
         Cue activeCue = cues.get(activeIndex);
         if (!activeCue.text.contentEquals(lyricView.getText())) {
             lyricView.setText(activeCue.text);
+            updateFloatingLyricText();
         }
         if (currentCueIndex != activeIndex) {
             currentCueIndex = activeIndex;
@@ -1177,6 +1961,7 @@ public class MainActivity extends Activity {
 
     private void clearLyricState() {
         lyricView.setText("");
+        updateFloatingLyricText();
         if (currentCueIndex != -1) {
             currentCueIndex = -1;
             lyricsAdapter.notifyDataSetChanged();
@@ -1219,6 +2004,7 @@ public class MainActivity extends Activity {
         }
         currentCueIndex = position;
         lyricView.setText(cue.text);
+        updateFloatingLyricText();
         playButton.setText(ICON_PAUSE);
         miniPlayButton.setText(ICON_PAUSE);
         statusView.setText("播放中");
@@ -1298,6 +2084,7 @@ public class MainActivity extends Activity {
     private void resetPlaybackUi() {
         coverView.setImageDrawable(null);
         lyricView.setText("");
+        updateFloatingLyricText();
         currentImageIndex = 0;
         seekBar.setProgress(0);
         seekBar.setMax(0);
@@ -1326,13 +2113,13 @@ public class MainActivity extends Activity {
         if (miniPlayer == null) {
             return;
         }
-        boolean hasPlayback = player != null && currentIndex >= 0 && currentIndex < playlist.size();
-        boolean showMini = hasPlayback && pageMode != PAGE_PLAYER;
+        MediaItem item = currentPlaybackItem();
+        boolean hasPlayback = player != null && item != null;
+        boolean showMini = hasPlayback && !(currentTab == TAB_MY && pageMode == PAGE_PLAYER);
         miniPlayer.setVisibility(showMini ? View.VISIBLE : View.GONE);
         if (!hasPlayback) {
             return;
         }
-        MediaItem item = playlist.get(currentIndex);
         miniTitleView.setText(item.audio.name);
         boolean playing = false;
         try {
@@ -1344,32 +2131,39 @@ public class MainActivity extends Activity {
     }
 
     private void showCurrentTrackImage() {
-        if (currentIndex < 0 || currentIndex >= playlist.size()) {
+        MediaItem item = currentPlaybackItem();
+        if (item == null) {
             coverView.setImageDrawable(null);
             return;
         }
-        MediaItem item = playlist.get(currentIndex);
         if (!item.images.isEmpty()) {
             currentImageIndex = Math.max(0, Math.min(currentImageIndex, item.images.size() - 1));
             coverView.setImageURI(item.images.get(currentImageIndex).uri);
-        } else if (activeWork != null && activeWork.cover != null) {
-            coverView.setImageURI(activeWork.cover.uri);
+        } else if (playbackWork != null && playbackWork.cover != null) {
+            coverView.setImageURI(playbackWork.cover.uri);
         } else {
             coverView.setImageDrawable(null);
         }
     }
 
     private void showNextTrackImage() {
-        if (pageMode != PAGE_PLAYER || currentIndex < 0 || currentIndex >= playlist.size()) {
+        MediaItem item = currentPlaybackItem();
+        if (pageMode != PAGE_PLAYER || item == null) {
             return;
         }
-        MediaItem item = playlist.get(currentIndex);
         if (item.images.size() <= 1) {
             return;
         }
         currentImageIndex = (currentImageIndex + 1) % item.images.size();
         showCurrentTrackImage();
         statusView.setText("图片 " + (currentImageIndex + 1) + "/" + item.images.size());
+    }
+
+    private MediaItem currentPlaybackItem() {
+        if (currentIndex < 0 || currentIndex >= playbackQueue.size()) {
+            return null;
+        }
+        return playbackQueue.get(currentIndex);
     }
 
     private boolean isSupportedAsset(String name) {
@@ -1428,6 +2222,65 @@ public class MainActivity extends Activity {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
+    private void loadCoverInto(ImageView imageView, FileDoc cover) {
+        if (cover == null) {
+            imageView.setTag(null);
+            imageView.setImageDrawable(workPlaceholder);
+            return;
+        }
+        String key = cover.uri.toString();
+        imageView.setTag(key);
+        Bitmap cached = coverCache.get(key);
+        if (cached != null) {
+            imageView.setImageBitmap(cached);
+            return;
+        }
+        imageView.setImageDrawable(workPlaceholder);
+        int targetSize = dp(72);
+        imageExecutor.execute(() -> {
+            Bitmap bitmap = decodeThumbnail(cover.uri, targetSize);
+            if (bitmap == null) {
+                return;
+            }
+            coverCache.put(key, bitmap);
+            handler.post(() -> {
+                Object tag = imageView.getTag();
+                if (key.equals(tag)) {
+                    imageView.setImageBitmap(bitmap);
+                }
+            });
+        });
+    }
+
+    private Bitmap decodeThumbnail(Uri uri, int targetSize) {
+        try {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            try (InputStream input = getContentResolver().openInputStream(uri)) {
+                if (input == null) {
+                    return null;
+                }
+                BitmapFactory.decodeStream(input, null, bounds);
+            }
+            int sampleSize = 1;
+            while ((bounds.outWidth / sampleSize) > targetSize * 2
+                    || (bounds.outHeight / sampleSize) > targetSize * 2) {
+                sampleSize *= 2;
+            }
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inSampleSize = Math.max(1, sampleSize);
+            options.inPreferredConfig = Bitmap.Config.RGB_565;
+            try (InputStream input = getContentResolver().openInputStream(uri)) {
+                if (input == null) {
+                    return null;
+                }
+                return BitmapFactory.decodeStream(input, null, options);
+            }
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
     private class BrowserAdapter extends BaseAdapter {
         @Override
         public int getCount() {
@@ -1453,68 +2306,108 @@ public class MainActivity extends Activity {
         }
 
         private View workRow(WorkItem work, int position, View convertView) {
-            LinearLayout row = new LinearLayout(MainActivity.this);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setPadding(dp(8), dp(8), dp(8), dp(8));
-            row.setMinimumHeight(dp(88));
-
-            ImageView thumb = new ImageView(MainActivity.this);
-            thumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
-            thumb.setBackgroundColor(Color.rgb(31, 35, 41));
-            if (work.cover != null) {
-                thumb.setImageURI(work.cover.uri);
+            WorkRowHolder holder;
+            LinearLayout row;
+            if (convertView instanceof LinearLayout && convertView.getTag() instanceof WorkRowHolder) {
+                row = (LinearLayout) convertView;
+                holder = (WorkRowHolder) row.getTag();
             } else {
-                thumb.setImageDrawable(new TextDrawable("ASMR"));
+                row = new LinearLayout(MainActivity.this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setPadding(dp(10), dp(8), dp(10), dp(8));
+                row.setMinimumHeight(dp(88));
+                row.setBackgroundResource(R.drawable.list_card);
+
+                holder = new WorkRowHolder();
+                holder.thumb = new ImageView(MainActivity.this);
+                holder.thumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                holder.thumb.setBackgroundColor(Color.rgb(226, 232, 238));
+                row.addView(holder.thumb, new LinearLayout.LayoutParams(dp(72), dp(72)));
+
+                LinearLayout texts = new LinearLayout(MainActivity.this);
+                texts.setOrientation(LinearLayout.VERTICAL);
+                texts.setGravity(Gravity.CENTER_VERTICAL);
+                texts.setPadding(dp(12), 0, 0, 0);
+                row.addView(texts, new LinearLayout.LayoutParams(0, -1, 1));
+
+                holder.title = label("", 16, Color.rgb(24, 28, 40));
+                holder.title.setSingleLine(true);
+                holder.title.setEllipsize(TextUtils.TruncateAt.END);
+                texts.addView(holder.title, new LinearLayout.LayoutParams(-1, 0, 1));
+
+                holder.subtitle = label("", 13, Color.rgb(118, 127, 139));
+                holder.subtitle.setSingleLine(true);
+                holder.subtitle.setEllipsize(TextUtils.TruncateAt.END);
+                texts.addView(holder.subtitle, new LinearLayout.LayoutParams(-1, 0, 1));
+                row.setTag(holder);
             }
-            row.addView(thumb, new LinearLayout.LayoutParams(dp(72), dp(72)));
 
-            LinearLayout texts = new LinearLayout(MainActivity.this);
-            texts.setOrientation(LinearLayout.VERTICAL);
-            texts.setGravity(Gravity.CENTER_VERTICAL);
-            texts.setPadding(dp(12), 0, 0, 0);
-            row.addView(texts, new LinearLayout.LayoutParams(0, -1, 1));
-
+            loadCoverInto(holder.thumb, work.cover);
             boolean moving = position == movingWorkIndex;
-            TextView title = label(work.name, 16, moving ? Color.rgb(245, 199, 117) : Color.rgb(236, 240, 243));
-            title.setSingleLine(true);
-            title.setEllipsize(TextUtils.TruncateAt.END);
-            texts.addView(title, new LinearLayout.LayoutParams(-1, 0, 1));
-
+            holder.title.setText(work.name);
+            holder.title.setTextColor(moving ? Color.rgb(163, 111, 28) : Color.rgb(24, 28, 40));
             String coverState = work.cover == null ? "无封面" : "有封面";
             String subtitle = moving ? "拖动中 · 松开保存位置" : work.tracks.size() + " 首音轨 · " + coverState;
-            TextView sub = label(subtitle, 13, moving ? Color.rgb(245, 199, 117) : Color.rgb(160, 169, 178));
-            sub.setSingleLine(true);
-            sub.setEllipsize(TextUtils.TruncateAt.END);
-            texts.addView(sub, new LinearLayout.LayoutParams(-1, 0, 1));
-
+            holder.subtitle.setText(subtitle);
+            holder.subtitle.setTextColor(moving ? Color.rgb(163, 111, 28) : Color.rgb(118, 127, 139));
             return row;
         }
 
         private View trackRow(MediaItem item, int position, View convertView) {
-            LinearLayout row = new LinearLayout(MainActivity.this);
-            row.setOrientation(LinearLayout.VERTICAL);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setPadding(dp(12), dp(7), dp(12), dp(7));
-            row.setMinimumHeight(dp(58));
+            TrackRowHolder holder;
+            LinearLayout row;
+            if (convertView instanceof LinearLayout && convertView.getTag() instanceof TrackRowHolder) {
+                row = (LinearLayout) convertView;
+                holder = (TrackRowHolder) row.getTag();
+            } else {
+                row = new LinearLayout(MainActivity.this);
+                row.setOrientation(LinearLayout.VERTICAL);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                row.setPadding(dp(12), dp(8), dp(12), dp(8));
+                row.setMinimumHeight(dp(58));
+                row.setBackgroundResource(R.drawable.list_card);
 
+                holder = new TrackRowHolder();
+                holder.title = label("", 15, Color.rgb(24, 28, 40));
+                holder.title.setSingleLine(true);
+                holder.title.setEllipsize(TextUtils.TruncateAt.END);
+                row.addView(holder.title, new LinearLayout.LayoutParams(-1, 0, 1));
+
+                holder.subtitle = label("", 12, Color.rgb(118, 127, 139));
+                holder.subtitle.setSingleLine(true);
+                holder.subtitle.setEllipsize(TextUtils.TruncateAt.END);
+                row.addView(holder.subtitle, new LinearLayout.LayoutParams(-1, 0, 1));
+                row.setTag(holder);
+            }
+
+            MediaItem current = currentPlaybackItem();
+            boolean sameWork = playbackWork != null && activeWork != null && playbackWork.key.equals(activeWork.key);
+            boolean isCurrent = sameWork && current != null && current.key.equals(item.key);
             int titleColor = position == movingTrackIndex
-                    ? Color.rgb(245, 199, 117)
-                    : (position == currentIndex ? Color.rgb(143, 210, 182) : Color.rgb(230, 233, 237));
-            TextView title = label(item.audio.name, 15, titleColor);
-            title.setSingleLine(true);
-            title.setEllipsize(TextUtils.TruncateAt.END);
-            row.addView(title, new LinearLayout.LayoutParams(-1, 0, 1));
+                    ? Color.rgb(163, 111, 28)
+                    : (isCurrent ? Color.rgb(69, 128, 99) : Color.rgb(24, 28, 40));
+            holder.title.setText(item.audio.name);
+            holder.title.setTextColor(titleColor);
 
             String subtitle = position == movingTrackIndex
                     ? "拖动中 · 松开保存位置"
                     : (item.vtt == null ? "无字幕" : "VTT") + " · " + item.audio.parentPath;
-            TextView sub = label(subtitle, 12, position == movingTrackIndex ? Color.rgb(245, 199, 117) : Color.rgb(160, 169, 178));
-            sub.setSingleLine(true);
-            sub.setEllipsize(TextUtils.TruncateAt.END);
-            row.addView(sub, new LinearLayout.LayoutParams(-1, 0, 1));
+            holder.subtitle.setText(subtitle);
+            holder.subtitle.setTextColor(position == movingTrackIndex ? Color.rgb(163, 111, 28) : Color.rgb(118, 127, 139));
             return row;
         }
+    }
+
+    private static class WorkRowHolder {
+        ImageView thumb;
+        TextView title;
+        TextView subtitle;
+    }
+
+    private static class TrackRowHolder {
+        TextView title;
+        TextView subtitle;
     }
 
     private class LyricsAdapter extends BaseAdapter {
@@ -1541,16 +2434,94 @@ public class MainActivity extends Activity {
             row.setGravity(Gravity.CENTER_VERTICAL);
             row.setPadding(dp(12), dp(10), dp(12), dp(10));
             row.setMinimumHeight(dp(72));
+            row.setBackgroundResource(R.drawable.list_card);
 
             boolean active = position == currentCueIndex;
-            TextView time = label(formatTime((int) cue.startMs), 12, active ? Color.rgb(143, 210, 182) : Color.rgb(137, 146, 156));
+            TextView time = label(formatTime((int) cue.startMs), 12, active ? Color.rgb(69, 128, 99) : Color.rgb(118, 127, 139));
             row.addView(time, new LinearLayout.LayoutParams(-1, dp(22)));
 
-            TextView text = label(cue.text, active ? 17 : 15, active ? Color.WHITE : Color.rgb(196, 204, 212));
+            TextView text = label(cue.text, active ? 17 : 15, active ? Color.rgb(24, 28, 40) : Color.rgb(78, 86, 98));
             text.setGravity(Gravity.CENTER_VERTICAL);
             text.setMaxLines(4);
             text.setEllipsize(TextUtils.TruncateAt.END);
             row.addView(text, new LinearLayout.LayoutParams(-1, -2));
+            return row;
+        }
+    }
+
+    private class WebHistoryAdapter extends BaseAdapter {
+        @Override
+        public int getCount() {
+            return webHistory.size();
+        }
+
+        @Override
+        public Object getItem(int position) {
+            return webHistory.get(position);
+        }
+
+        @Override
+        public long getItemId(int position) {
+            return position;
+        }
+
+        @Override
+        public int getViewTypeCount() {
+            return 2;
+        }
+
+        @Override
+        public int getItemViewType(int position) {
+            return pageMode == PAGE_WORKS ? 0 : 1;
+        }
+
+        @Override
+        public View getView(int position, View convertView, ViewGroup parent) {
+            TextView row = label(webHistory.get(position), 13, Color.rgb(54, 63, 76));
+            row.setSingleLine(true);
+            row.setEllipsize(TextUtils.TruncateAt.END);
+            row.setPadding(dp(10), 0, dp(10), 0);
+            row.setMinimumHeight(dp(44));
+            row.setBackgroundResource(R.drawable.list_card);
+            return row;
+        }
+    }
+
+    private class RecentAdapter extends BaseAdapter {
+        @Override
+        public int getCount() {
+            return recentTracks.size();
+        }
+
+        @Override
+        public Object getItem(int position) {
+            return recentTracks.get(position);
+        }
+
+        @Override
+        public long getItemId(int position) {
+            return position;
+        }
+
+        @Override
+        public View getView(int position, View convertView, ViewGroup parent) {
+            RecentTrack recent = recentTracks.get(position);
+            LinearLayout row = new LinearLayout(MainActivity.this);
+            row.setOrientation(LinearLayout.VERTICAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(12), dp(8), dp(12), dp(8));
+            row.setMinimumHeight(dp(68));
+            row.setBackgroundResource(R.drawable.list_card);
+
+            TextView title = label(recent.trackName, 15, Color.rgb(24, 28, 40));
+            title.setSingleLine(true);
+            title.setEllipsize(TextUtils.TruncateAt.END);
+            row.addView(title, new LinearLayout.LayoutParams(-1, 0, 1));
+
+            TextView sub = label(TextUtils.isEmpty(recent.workName) ? "未知作品" : recent.workName, 12, Color.rgb(118, 127, 139));
+            sub.setSingleLine(true);
+            sub.setEllipsize(TextUtils.TruncateAt.END);
+            row.addView(sub, new LinearLayout.LayoutParams(-1, 0, 1));
             return row;
         }
     }
@@ -1700,6 +2671,20 @@ public class MainActivity extends Activity {
             this.images = images;
             this.image = images.isEmpty() ? null : images.get(0);
             this.vtt = vtt;
+        }
+    }
+
+    private static class RecentTrack {
+        final String workKey;
+        final String trackKey;
+        final String workName;
+        final String trackName;
+
+        RecentTrack(String workKey, String trackKey, String workName, String trackName) {
+            this.workKey = workKey;
+            this.trackKey = trackKey;
+            this.workName = workName;
+            this.trackName = trackName;
         }
     }
 
