@@ -1,5 +1,32 @@
+import java.util.Properties
+
 plugins {
     id "com.android.application"
+}
+
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+def keystoreProperties = new Properties()
+def releaseSigningReady = keystorePropertiesFile.exists()
+
+if (releaseSigningReady) {
+    keystorePropertiesFile.withInputStream { stream ->
+        keystoreProperties.load(stream)
+    }
+
+    ["storeFile", "storePassword", "keyAlias", "keyPassword"].each { key ->
+        if (!keystoreProperties[key]) {
+            throw new GradleException("Missing ${key} in keystore.properties")
+        }
+    }
+}
+
+gradle.taskGraph.whenReady { taskGraph ->
+    def releaseTaskRequested = taskGraph.allTasks.any { task ->
+        task.path == ":app:assembleRelease" || task.path == ":app:bundleRelease" || task.path == ":app:lintRelease"
+    }
+    if (releaseTaskRequested && !releaseSigningReady) {
+        throw new GradleException("Missing keystore.properties. Generate or provide a release signing key before building release APKs.")
+    }
 }
 
 android {
@@ -10,7 +37,28 @@ android {
         applicationId "com.codex.asmrplayer"
         minSdk 23
         targetSdk 35
-        versionCode 3
-        versionName "1.3.0"
+        versionCode 4
+        versionName "1.4.0"
+    }
+
+    signingConfigs {
+        release {
+            if (releaseSigningReady) {
+                storeFile rootProject.file(keystoreProperties["storeFile"])
+                storePassword keystoreProperties["storePassword"]
+                keyAlias keystoreProperties["keyAlias"]
+                keyPassword keystoreProperties["keyPassword"]
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            if (releaseSigningReady) {
+                signingConfig signingConfigs.release
+            }
+            minifyEnabled false
+            shrinkResources false
+        }
     }
 }

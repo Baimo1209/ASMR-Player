@@ -5,6 +5,10 @@
 app/build/
 *.iml
 local.properties
+keystore.properties
+*.jks
+*.keystore
+*.p12
 *.apk
 RJ*/
 *.mp3
