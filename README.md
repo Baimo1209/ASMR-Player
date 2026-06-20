@@ -3,6 +3,9 @@
 前言：codex神力制作，之前一直苦于没有好用的安卓ASMR播放软件，这个基本上所有下载的ASMR音声文件放在文件夹中都能生成列表，图片预览，选择播放，台词轮播跳转，总之该有的都有啦，很方便的啦，UI是我按照个人怎么爽怎么来的，总之就是欢迎尝试！QAQ
 
 源码就在这里应该也不用担心有病毒，包体非常非常小只有不到1MB，也欢迎提出意见。
+<img width="1080" height="2400" alt="Screenshot_2026-06-20-14-56-07-348_com codex asmr" src="https://github.com/user-attachments/assets/aae1d6ff-f6f3-4185-afcc-a665689a18f0" />
+<img width="1080" height="2400" alt="IMG_20260620_145654" src="https://github.com/user-attachments/assets/5e1d4fc6-1cec-4054-8f6a-55b9ac088d31" />
+
 
 ASMR Player 是一款面向安卓手机的本地 ASMR 音声播放器。它适合管理下载到本地的音声作品目录，尤其是类似 `RJ01534688/1-普通版/MP3` 这样的多层作品结构。应用会从系统文件夹选择器读取用户选择的目录，递归扫描音频、图片和 WebVTT 台词文件，并自动整理成作品列表、音轨列表和播放页面。
 
