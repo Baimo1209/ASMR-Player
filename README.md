@@ -6,7 +6,6 @@ ASMR Player 是一款安卓本地 ASMR 音声播放器，应用安装后显示�
 
 ## 截图
 
-<img width="1080" height="2400" alt="ASMR Player 作品列表" src="https://github.com/user-attachments/assets/aae1d6ff-f6f3-4185-afcc-a665689a18f0" />
 
 <img width="1080" height="2400" alt="ASMR Player 播放页面" src="https://github.com/user-attachments/assets/5e1d4fc6-1cec-4054-8f6a-55b9ac088d31" />
 
